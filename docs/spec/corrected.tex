@@ -1,0 +1,1640 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+
+\setlist[itemize]{itemsep=0.2em,topsep=0.3em}
+\setlist[enumerate]{itemsep=0.25em,topsep=0.35em}
+
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\Rng}{\mathsf{Rng}}
+\newcommand{\Bnd}{\mathsf{Bnd}}
+\newcommand{\Fp}{\F_p}
+\newcommand{\Fq}{\F_{p^4}}
+\newcommand{\Fo}{\F_{p^8}}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+
+\title{A sound small-field sumcheck prover for transformer inference\\[2pt]
+\large Corrected design specification}
+\author{Revision of the 11 October 2026 draft}
+\date{12 October 2026 (revision 11)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document specifies a hash-based argument that a committed, integer-quantized transformer, on a public prompt and a client-derived sampling seed, produced a claimed token sequence.
+It replaces the earlier draft, whose constraint system let a prover change the computation and still pass verification, and whose cost model was borrowed from another system.
+Every value in the function being proved is now a deterministic function of its inputs, every field equation is shown not to wrap, every lookup output is committed or reduced, and challenges are drawn only after the data they test is fixed.
+Security is \(100\) bits under proven bounds (Mode~P), for the main proof and for its recursive compression together: sumcheck, GKR and lookup challenges are drawn in a degree-\(4\) extension of the KoalaBear field \(p = 2^{31} - 2^{24} + 1\), and the polynomial commitment works in the degree-\(8\) extension that its proven proximity bound needs.
+The cost model counts committed elements, lookups and constraint terms per gadget and prices them from hardware rates; the prover has not been implemented, and the unit costs carry a \([0.5\times, 2\times]\) band.
+Two prover profiles are costed.
+The baseline profile uses the gadgets as first specified.
+The optimized profile proves a slightly different quantized function \(F_O\) and adds multi-column range tables, fused gadgets, a rate-\(1/2\) code, and small-value sumcheck; it is \(2.1\)--\(2.3\times\) cheaper.
+Central projections of the main proof, baseline / optimized: one H100 proves a \(16\)K-token Llama~3.1~8B sequence at \(79\) / \(170\) tokens/s, and a Qwen2.5-32B-shaped model at \(28\) / \(62\) tokens/s (\(42\) / \(110\) on four \(4\)K sequences, against \(53\) and \(77\) published by Attestable for a comparable model); eight RTX~PRO~6000 cards prove a \(16\)K GLM-5.3-Flash sequence in \(102\) / \(50\) seconds.
+The main proof is tens of MiB to several GiB, so a recursive stage, which proves the main proof's verifier with the same field, hash and security mode, compresses it to a zero-knowledge proof of about \(400\)\,KiB for \(4\)--\(6\%\) more work.
+Including recursion, for requests up to \(8\)K tokens, proving every request multiplies GPU time by \(6\)--\(24\times\) / \(3\)--\(11\times\) against single-stream serving and by \(36\)--\(175\times\) / \(18\)--\(78\times\) against a batched server; at \(\$2.50\) per H100-hour the optimized profile costs about \(\$4.3\) per million proven tokens for the 8B model and \(\$9.9\) for GLM-5.3-Flash.
+For multi-turn sessions, one proof of the final context covers every turn with the default security and is \(2\)--\(8\times\) cheaper than proving every turn from the first token; an optional session mode proves each turn as it ends for about the same cost.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{Scope and what changed}
+\label{sec:changes}
+
+The statement is unchanged in spirit: the verifier, without the weights and without re-running the model, is convinced that \(y = F(W,x,r)\) for a committed \(W\).
+What changed is that \(F\) is now fully determined and every step of it is constrained.
+Table~\ref{tab:changes} maps each defect of the previous draft to its fix.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.43\linewidth}p{0.52\linewidth}@{}}
+\toprule
+Defect in the previous draft & Fix in this specification \\
+\midrule
+Quantization scale not tied to the data; any scale with \(q=0\) passed & Scale exponent proved minimal by a selected witness element (\S\ref{sec:g-req}) \\
+Honest scale rule clipped at \(m_g=128, 255, \ldots\) & Rule redefined so the honest value never clips (\S\ref{sec:g-req}) \\
+Sums of squares, rescales and softmax sums wrapped mod \(p\) & No-wrap invariant with a bound for every relation (Table~\ref{tab:bounds}) \\
+Per-group scales could not factor out of the product & Activation scales per row, weight scales per output column; both lie off the reduction axis (\S\ref{sec:formats}) \\
+Attention probabilities and KDA states not committed & Every lookup output is committed; KDA states committed at chunk boundaries (\S\ref{sec:attn}, \S\ref{sec:kda}) \\
+LogUp inverses committed before their challenge & LogUp by GKR fractional sums; no challenge-dependent commitment (\S\ref{sec:logup}) \\
+Uniform noise in place of Gumbel; temperature unused; seed chosen by server & Inverse-CDF sampling with a client-derived seed and tabulated temperatures (\S\ref{sec:sampling}) \\
+Zero knowledge cancelled the mask in the clear & Optional ZK mode with salted leaves, randomized codewords, and Libra-style masks (\S\ref{sec:zk}) \\
+LogUp and FRI terms missing from the \(100\)-bit budget & Two security modes with a full budget (\S\ref{sec:security}) \\
+Reed--Solomon over \(\Fp\) with no smooth domain & Field with a \(2^{24}\) smooth domain (revision~3; revision~2 used a circle code) (\S\ref{sec:pcs}) \\
+Cost model: one borrowed constant, \(O(\text{MACs})\) scaling & Per-gadget accounting priced from hardware rates (\S\ref{sec:cost}) \\
+Serving bill against single-stream rates of a different function & Bill against single-stream and batched serving of \(F\) itself (\S\ref{sec:serving}) \\
+\bottomrule
+\end{tabular}
+\caption{Defects of the previous draft and where they are fixed.}
+\label{tab:changes}
+\end{table}
+
+Revision~3 fixes defects found in a review of revision~2 (Table~\ref{tab:rev3}).
+Items marked \emph{open} are specified as requirements, not as finished designs.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Defect in revision 2 & Fix in revision 3 \\
+\midrule
+LogUp over \(\Fp\) with more than \(p\) lookups: \(p\) copies of a bad tuple cancel & Chunks of at most \(2^{30}\) lookups, each with its own multiplicities (\S\ref{sec:logup}) \\
+\(\mathsf{Requant8}\) minimality tested \(e-2\), not \(e-1\): one free exponent bit & Constant corrected to \(4a - 255s\) (\S\ref{sec:g-req}) \\
+\(\mathsf{MulRound}\) did not bound \(t\); \((t + 2^{19}, v - 1)\) passed by wrap & Range check on \(t\) (\S\ref{sec:g-mul}) \\
+Selected indices (maxima, top-\(k\), slots) not restricted to causal, unpadded positions & Index bound per row; masked entries fixed by the lookup input (\S\ref{sec:g-max}) \\
+Top-\(k\) tie indicator enforced in one direction only & Strict-inequality form with a tie flag (\S\ref{sec:g-max}) \\
+Short softmax rows and single-outlier norm rows had no normalization witness & Signed normalization shift (\S\ref{sec:g-norm}) \\
+Server-chosen prompt parts and truncated outputs passed as valid statements & Prompt provenance, stop rule in the statement, signed receipts (\S\ref{sec:statement}) \\
+Proofs of several users' requests shared a trace in the clear & Single-tenant proofs by default; multi-tenant only with ZK (\S\ref{sec:protocol}) \\
+BaseFold over a circle code is not an analyzed construction & KoalaBear field and Reed--Solomon codes (\S\ref{sec:crypto}) \\
+ZK mode used non-multilinear masks with a multilinear commitment & ZK mode marked \emph{open} (\S\ref{sec:zk}) \\
+Proof size of \(10\)--\(30\)\,MiB ignored the per-unit transcripts & Size and verification time modeled; recursion \emph{open} and required (\S\ref{sec:size}); added in revision~4 (\S\ref{sec:recursion}) \\
+Serving kernels for \(F\) assumed to run at FP8 speed & Kernel requirements stated (\S\ref{sec:serving}) \\
+\bottomrule
+\end{tabular}
+\caption{Defects of revision 2 and where they are fixed.}
+\label{tab:rev3}
+\end{table}
+
+Revision~4 changes cost, not the function or the security level (Table~\ref{tab:rev4}).
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Change in revision 4 & Effect \\
+\midrule
+Sumcheck, GKR and lookup challenges in \(\Fq\) with two lookup instances; commitment in \(\Fo\) (\S\ref{sec:fields}) & Same proven \(100\)-bit bound at \(0.74\)--\(0.76\times\) the work; Mode~C now saves only \(4\%\) \\
+Optional shared weight opening with salted transcripts (\S\ref{sec:weights}) & Short requests on large-weight models: up to \(0.6\times\) the proof time \\
+Recursive compression with BLAKE3 throughout (\S\ref{sec:recursion}) & About \(400\)\,KiB proofs and \(50\)\,ms verification, for \(9\)--\(11\%\) more work \\
+One Merkle leaf per unit and coset, all columns (\S\ref{sec:pcs}) & One path per unit per query; proof-size model corrected for leaf width \\
+\bottomrule
+\end{tabular}
+\caption{Changes in revision 4.}
+\label{tab:rev4}
+\end{table}
+
+Revision~5 fixes defects found in a review of revision~4 and adds four optimizations that keep every proven bound (Table~\ref{tab:rev5}).
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Defect or change in revision 4 & Revision 5 \\
+\midrule
+Outer circuits not fixed by the registry: a server could compress with an outer circuit that accepts anything & Digest \(h_{\mathrm{rec}}\) of every outer circuit in the registry entry and the public input; one segment circuit per layer (\S\ref{sec:recursion}) \\
+Compressed proof claimed to hide the salt, but its openings expose inner trace cells; public \(\mathsf{H}(x)\) lets anyone test guesses of a short prompt & Zero-knowledge outer layers; salted digests in the public input (\S\ref{sec:recursion}) \\
+Main proof and outer layers each at \(100\) bits: the composition is about \(97.4\) bits & Tight terms at \(103\) bits in every layer (\S\ref{sec:recursion}) \\
+Shared weight opening charged as if each proof's claim reduction were shared too & Reduction charged per proof; only fold, encoding and opening are shared (\S\ref{sec:weights}) \\
+\midrule
+Lookup budget computed for \(2^{50}\) lookups in one relation, although each chunk is checked alone & One LogUp instance per chunk with \(11\) bits of grinding, \(2^{-103.9}\) (\S\ref{sec:logup}); lookup work halves \\
+Leaves of \(16\) codeword positions dominate the recursion & Leaves of \(4\) positions, Merkle caps, \(30\)-bit query grinding (\S\ref{sec:pcs}); recursion \(4\)--\(6\%\), main proof about \(3\times\) smaller \\
+\bottomrule
+\end{tabular}
+\caption{Defects of revision 4 and changes in revision 5.}
+\label{tab:rev5}
+\end{table}
+
+Revision~6 fixes defects in attention and selection found in a review of revision~5 (Table~\ref{tab:rev6}); the projections change by under \(0.2\%\).
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Defect in revision 5 & Fix in revision 6 \\
+\midrule
+Bits of selected indices not constrained to \(\{0,1\}\): row maxima, \(\mathsf{Requant8}\) exponents and top-\(k\) thresholds could be forged & \(b(1-b) = 0\) for every index bit (\S\ref{sec:g-max}) \\
+\(PV\) proved as one unblocked sum, unlike the blockwise-rounded \(N\) of \(F\) & Batched sumcheck over block partials and \(D\) (\S\ref{sec:attn}) \\
+Sum of rounded \(PV\) blocks up to \(2^{29}\), outside the input domain of \(\mathsf{MulRound}\) & Per-row block shift \(k_m = \max(7, E_m)\) from \(D\)'s exponent; \(|N| < 2^{23}\) (\S\ref{sec:attn}) \\
+Selection sumcheck taken as degree \(\le 4\) & Degree \(\le 17\) in the row rounds, \(2^{-119.9}\); key variables bound first (\S\ref{sec:g-max}) \\
+\(10\)-bit probabilities drop the mass of diffuse heads at long context & Option of \(12\)-bit probabilities with \(2^{10}\)-key blocks, \(1.07\)--\(1.19\times\) the work (\S\ref{sec:attn}) \\
+\bottomrule
+\end{tabular}
+\caption{Defects of revision 5 and their fixes.}
+\label{tab:rev6}
+\end{table}
+
+Revision~7 closes the same gap for indices that address data, specifies the gathers that read through them, and corrects the cost model's count of \(PV\) blocks (Table~\ref{tab:rev7}); dense models become about \(2\%\) cheaper and GLM-5.3-Flash about \(0.7\%\) dearer.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Defect in revision 6 & Fix in revision 7 \\
+\midrule
+Bits of expert indices and sparse slot indices not constrained to \(\{0,1\}\): a gathered expert or key could be a combination of several & \(b(1-b) = 0\) for every address bit (\S\ref{sec:g-max}); \(+0.7\)--\(0.9\%\) for GLM-5.3-Flash \\
+No proof mechanism for the MoE dispatch or the gather of latent keys and values in sparse attention & Gather sumcheck with \(k\) bound first, degree \(\le 20\) in the address rounds, \(2^{-119.7}\) (\S\ref{sec:gather}); one gather pass of prover work, under \(0.5\%\) and not charged \\
+Cost model charged every causal row the \(PV\) blocks of the longest row & Each row charged its own blocks: dense models about \(2\%\) cheaper; \(12\)-bit option \(1.04\)--\(1.10\times\) \\
+\bottomrule
+\end{tabular}
+\caption{Defects of revision 6 and their fixes.}
+\label{tab:rev7}
+\end{table}
+
+Revision~8 adds an optional session mode (\S\ref{sec:session}) that proves each turn of a session against commitments to the state of earlier turns, and lets a public prefix be proved once.
+The default mode and its projections are unchanged.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Limitation of revision 7 & Change in revision 8 \\
+\midrule
+Each turn of a session proved from position \(0\); session cost grows faster than the square of its length & Session mode: a state tree per turn, out-of-domain binding carried in a salted link digest, \(113\)-bit tight terms for up to \(2^{10}\) turns; \(2.1\)--\(6.3\times\) cheaper for \(4\)--\(16\) turns (Table~\ref{tab:session}) \\
+A public server prefix proved again in every request & Prefix proved once as turn~\(0\) and published with the registry entry; \(1.7\)--\(4.3\times\) cheaper for \(2\)--\(8\)K prefixes \\
+\bottomrule
+\end{tabular}
+\caption{Changes in revision 8.}
+\label{tab:rev8}
+\end{table}
+
+Revision~9 fixes defects in session mode found in a review of revision~8 (Table~\ref{tab:rev9}); the default mode is unchanged.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Defect in revision 8 & Fix in revision 9 \\
+\midrule
+Nothing tied the model of one turn to the model of the turns whose state it reads; a server could switch weights mid-session & Session header \(\eta = (C_W, h_{\mathrm{circ}}, h_{\mathrm{rec}}, \mathsf{policy})\) at the base of the link chain, checked by every turn (\S\ref{sec:session}) \\
+Claims on earlier state ``reduced to one point per earlier tree'' with no way to split a claim over trees at arbitrary offsets & Re-indexing sumcheck with a shifted \(\mathrm{eq}\), evaluable in \(O(\log S)\) \\
+Out-of-domain answers sent but not proved by the turn that commits the tree & Answers batched into that turn's own opening \\
+A full proof substituted for a turn could use \(103\)-bit parameters, exceeding the session budget & Substitutes use the session-mode parameters \\
+Each turn opened every earlier tree: recursion grows with \(k\), \(19\%\) of a \(1{,}024\)-turn session & Binary-counter merging of trees; at most \(\lfloor\log_2 k\rfloor + 1\) opened per turn; \(3\)--\(19\%\) cheaper for long sessions \\
+Session turns paid the full weight opening & Session turns join the shared opening by default; GLM-5.3-Flash sessions \(16\)--\(17\%\) cheaper \\
+\bottomrule
+\end{tabular}
+\caption{Defects of revision 8 and their fixes.}
+\label{tab:rev9}
+\end{table}
+
+Revision~10 follows a security comparison of session mode with proving from scratch (Table~\ref{tab:rev10}). It makes a whole-session proof, a single default-mode proof of the final context, the default for multi-turn work, and hardens session mode; the default mode is unchanged.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Weakness of revision 9 & Change in revision 10 \\
+\midrule
+Multi-turn cost cut available only through session mode's extra mechanisms & Whole-session proof (\S\ref{sec:whole}): all turns in one default-mode proof, cheaper than session mode, with the default security; checkpoints at turns \(1, 2, 4, \ldots\) for \(1.5\)--\(1.9\times\) \\
+Cross-proof binding relied on out-of-domain evaluations in the list-decoding regime, an argument not in the literature & State trees tested in the unique-decoding regime (\(200\) queries), so each root binds one codeword and the composition is standard; about \(0.1\%\) \\
+Consecutive turns linkable through \(\lambda\) in the public input & Freshly salted commitments to \((\chi, \lambda)\) per proof \\
+Turn limit \(T_{\max}\) not enforced by the protocol & Turn index in \(\lambda\); verifiers reject \(k > T_{\max}\) \\
+Server keeps per-session state & Stateless variant: client resends history and a session secret; \(+13\)--\(18\%\) at most \\
+A turn's guarantee silently depends on every earlier turn & Stated; clients keep the last verified \(\lambda\); whole-session proof recommended as a backstop \\
+\bottomrule
+\end{tabular}
+\caption{Changes in revision 10.}
+\label{tab:rev10}
+\end{table}
+
+Revision~11 closes the two items that revision~10 left open, the KDA and indexer gadgets and the session-mode composition, and fixes what writing them out exposed (Table~\ref{tab:rev11}). Dense models are unchanged; GLM-5.3-Flash is \(21\)--\(25\%\) dearer.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.47\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Open item or defect in revision 10 & Revision 11 \\
+\midrule
+KDA described by shape only; cost estimated at about \(3\%\) of GLM-5.3-Flash & Constraint-level KDA with decay factors \(\le 1\) by construction, a bounded state, and no-wrap bounds (\S\ref{sec:kda}); \(21\)--\(23\%\) of the work \\
+Indexer formats unstated & Pooling by exact sum of \(8\)-bit keys, ReLU after a \(12\)-bit shift, bounds in Table~\ref{tab:bounds} (\S\ref{sec:dsa}) \\
+Carried state listed pooled keys and omitted the KDA convolution history and the open chunk's decays & Per-token indexer keys, convolution inputs of \(3\) positions, and the open chunk's \(\hat k, \hat v, \lambda\); Lemma~\ref{lem:suff} \\
+Session composition not written out & Theorem~\ref{thm:session}, covering merged trees and the outer layers \\
+One unique-decoding test per tree and opening: about \(2^{14}\) terms at \(2^{-113}\) for \(2^{10}\) turns, which does not fit \(100\) bits & One batched test per turn at \(208\) queries (\(2^{-116.3}\)); session error \(2^{-100.1}\) \\
+Closed-weight \(C_W\) opened only in the Johnson regime: proofs could be bound to different weights near one root & Unique-decoding test of \(C_W\) in the registry entry, once per release \\
+\bottomrule
+\end{tabular}
+\caption{Changes in revision 11.}
+\label{tab:rev11}
+\end{table}
+
+%======================================================================
+\section{Statement}
+\label{sec:statement}
+
+\paragraph{Public input.}
+\begin{itemize}
+\item \(C_W\): commitment to the quantized model \(W\), the lookup tables, and the format constants (\S\ref{sec:weights}).
+\item \(\mathsf{policy}\): context bound, temperature index \(\theta \in \Theta\) (a fixed public set including \(0\)), top-\(k\) value or none, maximum output length \(G_{\max}\), stop set \(\Sigma_{\mathrm{stop}} \subset V\), tokenizer and chat-template identifiers, the digest \(h_{\mathrm{pre}}\) of any server prefix, protocol version, security mode.
+\item \(x \in V^{P}\): prompt token ids. \(y \in V^{G}\): generated token ids. \(S = P + G\).
+\item \(n_c \in \{0,1\}^{256}\): client nonce, chosen by the client and sent with the request.
+\end{itemize}
+The seed is not chosen by the prover:
+\[
+r = \mathsf{H}(\texttt{seed} \,\|\, n_c \,\|\, C_W \,\|\, \mathsf{H}(x) \,\|\, \mathsf{policy}).
+\]
+A deployment that must also stop the client from grinding \(n_c\) (for example, when third parties rely on the sample) replaces \(n_c\) by \(\mathsf{H}(n_c \| n_s)\), where the server committed to \(n_s\) before seeing \(n_c\).
+
+\paragraph{Prompt provenance.}
+Fixing \(r\) does not stop a server from choosing among outputs by varying prompt tokens it controls, since \(y\) depends on \(x\).
+The statement therefore guarantees nothing about server-chosen tokens unless they are fixed before \(n_c\) is seen.
+\(x\) is the concatenation of a server prefix whose digest \(h_{\mathrm{pre}}\) is in \(\mathsf{policy}\) and was published before the request, the client's messages rendered by the named template and tokenizer, and the template's assistant header.
+The client checks this decomposition before relying on a proof.
+Tokens injected by the server during a request (retrieved documents, tool results) are outside the guarantee, and a client that receives them knows they were server-chosen.
+
+\paragraph{Relation.}
+The verifier accepts only if \(C_W\) opens to some \(W\) and \(y = F(W, x, r)\), with \(F\) the integer function of \S\ref{sec:F}, evaluated autoregressively: \(y_t\) is sampled from the logits at position \(P + t - 1\) given \(x \| y_{<t}\).
+Because \(F\) is deterministic integer arithmetic, the prover can evaluate all \(S\) positions in one teacher-forced pass, and the result is bit-identical to the token-by-token decode that produced \(y\).
+
+\paragraph{Termination.}
+\(F\) stops at the first stop token or at \(G_{\max}\) tokens.
+The verifier checks this directly on the public \(y\): no \(y_t \in \Sigma_{\mathrm{stop}}\) for \(t < G\), and either \(y_G \in \Sigma_{\mathrm{stop}}\) or \(G = G_{\max}\).
+Without this check every prefix of a valid output is also valid, so a server could truncate answers.
+
+\paragraph{Receipt.}
+When it returns \(y\), the server signs \(\mathsf{H}(C_W \| \mathsf{policy} \| \mathsf{H}(x) \| \mathsf{H}(y) \| n_c)\) with a key registered alongside \(C_W\).
+The receipt makes a later audit enforceable: a server cannot claim it never served \(y\), and cannot prove against a different commitment.
+
+\paragraph{What is not claimed.}
+The statement is about \(F\), not about a BF16 or FP8 checkpoint.
+The server must serve \(F\) itself; a sequence decoded with other kernels will in general not satisfy the relation, because a single changed argmax or sampling decision changes \(y\).
+That \(C_W\) is the advertised model is established outside the proof: for open weights, anyone recomputes \(C_W\) from the published checkpoint with the published quantization program (\S\ref{sec:weights}).
+For closed weights the proof establishes consistency (every proven request used the same committed model), not identity.
+
+%======================================================================
+\section{The function \texorpdfstring{\(F\)}{F}}
+\label{sec:F}
+
+\subsection{Number formats}
+\label{sec:formats}
+
+\begin{itemize}
+\item \emph{Activations.} Every tensor that crosses an operation boundary is a signed integer in \(A = [-2^{23}, 2^{23})\) with a static number of fractional bits fixed per tensor type in \(C_W\).
+\item \emph{Matmul inputs.} A row of activations entering a product is quantized to \(q \in [-127,127]\) with one power-of-two exponent per row (\S\ref{sec:g-req}).
+\(V\) is later reduced along its token axis, so a per-token exponent would sit on the reduction axis; \(V\) therefore gets a static per-head exponent, and so do \(Q\) and \(K\), so that one softmax table serves every head (\S\ref{sec:g-reqs}, \S\ref{sec:attn}).
+\item \emph{Weights.} Each weight matrix is stored as integers in \([-127,127]\) with one power-of-two exponent per output column.
+Rotations in the style of SpinQuant/QuaRot are fused into the weights offline, before quantization, and are not computed in the proof.
+\item \emph{Scales off the reduction axis.} In every product \(C = AB\), the scale of \(A\) depends only on the row and the scale of \(B\) only on the column.
+The integer accumulator \(\sum_t q^A_{mt} q^B_{tn}\) is therefore exact, and the scale is applied once, by a shift, after the sum.
+\item \emph{Reduction length.} Every exact integer sum has at most \(2^{15}\) terms of magnitude at most \(127^2\), so \(|\mathrm{acc}| < 2^{29}\).
+Longer reductions (\(PV\) over long rows) are split into blocks whose partial results are shifted back into \(A\) before being added (\S\ref{sec:attn}).
+\end{itemize}
+
+\subsection{Operations}
+
+\(F\) is the composition of the operations below, each defined by one gadget of \S\ref{sec:gadgets}.
+The definitions are exact; \(F\) has no floating-point step and no data-dependent loop.
+
+\begin{enumerate}
+\item \emph{Embedding.} Row \(x_t\) of the committed embedding table.
+\item \emph{RMSNorm.} \(q = \mathsf{Requant8}(h)\); \(\Sigma = \sum_i q_i^2 + \epsilon_{\mathrm{int}}\); the per-row factor \(\mu = \tau_{\mathrm{rsqrt}}(\cdot)\) is applied to \(q\) by \(\mathsf{NormScale}\); the gain vector is fused into the next weight matrix.
+\item \emph{Linear layer.} \(c = \mathsf{ShiftRound}(\sum_t q_{mt} w_{tn},\ k_{mn})\), with \(k_{mn} = K_\ell - e_m - e^{W}_n\).
+\item \emph{RoPE.} Applied to \(24\)-bit \(Q\) and \(K\) with public \(16\)-bit cos/sin integers via \(\mathsf{MulRound}\).
+\item \emph{Attention.} \S\ref{sec:attn}.
+\item \emph{Residual.} \(h' = \mathsf{SatAdd}(h, c)\).
+\item \emph{Gated MLP.} \(g, u\) from two linear layers; \(a = \tau_{\mathrm{SiLU}}(g)\) with a \(16\)-bit output; \(m = \mathsf{MulRound}(u, a)\); then the down projection.
+\item \emph{Mixture of experts.} Router logits for all experts; top-\(k\) selection by \(\mathsf{TopK}\); expert products addressed by the selected index; router weights by table; weighted combine by \(\mathsf{MulRound}\).
+\item \emph{Linear attention (KDA)} and \emph{sparse attention with an indexer}: \S\ref{sec:kda}, \S\ref{sec:dsa}.
+\item \emph{Sampling}: \S\ref{sec:sampling}.
+\end{enumerate}
+
+\subsection{Full attention}
+\label{sec:attn}
+
+Per head, with static exponents \(e^Q_h, e^K_h, e^V_h\) chosen so that \(e^Q_h + e^K_h = E_{\mathrm{attn}}\) is one global constant:
+\begin{enumerate}
+\item \(\hat Q = \mathsf{Requant8S}(Q, e^Q_h)\), \(\hat K = \mathsf{Requant8S}(K, e^K_h)\), \(\hat V = \mathsf{Requant8S}(V, e^V_h)\).
+\item \(\mathrm{acc}_{mj} = \sum_{c} \hat Q_{mc} \hat K_{jc}\), \(|\mathrm{acc}| < 128 \cdot 127^2 < 2^{21}\). Not committed.
+\item \(M_m = \max_{j \le m} \mathrm{acc}_{mj}\) by a selected index \(j^\ast_m \le m\) (\S\ref{sec:g-max}).
+\item \(P_{mj} = \tau_{\exp}(\mathrm{acc}_{mj} - M_m) \in [0, 2^{10}]\) for \(j \le m\), and \(P_{mj} = 0\) for \(j > m\). One table serves every layer and head because \(E_{\mathrm{attn}}\) is global; the factor \(1/\sqrt{d_h}\) is inside the table. Masked entries are handled by the lookup input (\S\ref{sec:g-max}).
+\item \(D_m = \sum_j P_{mj} \in [2^{10}, 2^{30}]\) for \(S \le 2^{20}\), exact. \(\mathsf{Norm}\) with a signed shift (\S\ref{sec:g-norm}) gives \(D_m = 2^{E_m}\delta_m + \rho_m\) with a \(16\)-bit mantissa \(\delta_m\).
+\item Block partials \(N^{(b)}_{mc} = \sum_{j \in b} P_{mj} \hat V_{jc}\) over blocks \(b\) of \(2^{12}\) keys at fixed absolute positions, \(|N^{(b)}| < 2^{12}\cdot 2^{10}\cdot 127 < 2^{29}\), not committed.
+Each is rounded by \(\mathsf{ShiftRound}\) with the per-row shift \(k_m = \max(7, E_m)\), and \(N_{mc} = \sum_b \mathsf{ShiftRound}(N^{(b)}_{mc}, k_m)\).
+Then \(|N_{mc}| \le 127\, D_m / 2^{k_m} + 2^{8} < 2^{23}\): if \(E_m \ge 7\), \(D_m < 2^{E_m + 16}\); otherwise \(D_m < 2^{23}\) and \(k_m = 7\). So \(N \in A\), the input domain of \(\mathsf{MulRound}\).
+\item \(o_{mc} = \mathsf{MulRound}(N_{mc}, \tau_{\mathrm{recip}}(\delta_m))\), with a \(17\)-bit reciprocal and the shift adjusted by \(E_m - k_m\).
+\end{enumerate}
+The domain of the causal mask is a list of \(128\times128\) tiles on or below the diagonal, so the committed \(P\) has \(S^2/2 + 64S\) entries per head, not \(S^2\).
+Blocks are aligned to \(32\) tiles, so the block of key \(j\) is given by the high bits of \(j\).
+Each \(\mathsf{ShiftRound}\) takes its input claim on \(\tilde N^{(\cdot)}(r_m, r_b, r_c)\), and \(D\) has a claim \(\tilde D(r'_m)\) from \(\mathsf{Norm}\).
+Both are proved by one batched product sumcheck per head over the tile list,
+\[
+\textstyle\sum_{(m,j)} P_{mj}\big[\lambda\, \mathrm{eq}\big((r_m, r_b), (m, j_{\mathrm{hi}})\big)\, \tilde V(j, r_c) + \mu\, \mathrm{eq}(r'_m, m)\big]
+\]
+for random \(\lambda, \mu\), whose public tile-to-row and tile-to-column maps the verifier evaluates in \(O(\log S)\).
+Revision~5 stated one sumcheck of the unblocked sum \(\sum_j P_{mj}(\hat V_{jc} + \gamma)\), which is not the \(N\) that \(F\) defines for \(S > 2^{12}\), and summed the blocks to below \(2^{29}\), outside the domain of \(\mathsf{MulRound}\); an honest prover then had no valid witness for long rows.
+
+\emph{Option: \(12\)-bit probabilities.}
+\(10\)-bit probabilities set every key below about \(2^{-11}\) of the row maximum's weight to zero, and in a diffuse head at long context many such keys together outweigh the maximum.
+A model whose accuracy report shows this may use \(\tau_{\exp}\) with outputs in \([0, 2^{12}]\) and blocks of \(2^{10}\) keys: each block stays below \(2^{10}\cdot 2^{12}\cdot 127 < 2^{29}\), \(D_m \in [2^{12}, 2^{30}]\) for \(S \le 2^{18}\), and the \(N\) bound is unchanged.
+It costs \(1.04\)--\(1.10\times\) the work in the model for \(4\)K--\(64\)K tokens, with each causal row charged its own number of blocks.
+The choice is part of \(C_W\).
+
+\subsection{Linear attention (KDA)}
+\label{sec:kda}
+
+\emph{Architecture assumption.} Each of the \(64\) heads of a KDA layer runs the gated recurrence \(H_t = \mathrm{diag}(\gamma_t) H_{t-1} + k_t v_t^{\top}\), \(o_t = H_t^{\top} q_t\) with channel-wise decay \(\gamma_t \in (0,1)^{128}\) and \(H_t \in \mathbb{R}^{128\times128}\), preceded by short convolutions and \(L_2\) normalization of \(q\) and \(k\) and followed by a per-head output normalization and a sigmoid gate.
+This is the form without the delta rule.
+If the deployed model uses the delta rule, as Kimi's KDA does, then \(F\) needs a triangular solve per chunk, which this revision does not specify, at roughly \(2\)--\(3\times\) the KDA work below.
+Positions are absolute, chunks are \([128u, 128u + 128)\), and sub-chunks are the aligned blocks of \(8\) inside them.
+For a position \(t\), \(B_t\) is the first position of its sub-chunk, \(E_t\) the last, and \(c_0\) and \(c_1\) are the first and last positions of its chunk.
+
+\emph{Inputs, per position and head} (\(64 \times 128 = 8192\) channels per tensor):
+\begin{enumerate}
+\item Linear layers give \(q', k', v'\) and the gate input \(g'\) in \(A\). The decay logit \(a \in A\) comes from a rank-\(128\) projection: a linear layer, \(\mathsf{Requant8}\), a linear layer.
+\item \emph{Short convolutions} (width \(4\), depthwise, causal): \(\hat x = \mathsf{Requant8S}(x', e_x)\) for \(x \in \{q, k, v\}\); \(\kappa_t = \sum_{i=0}^{3} w^{x}_{i} \odot \hat x_{t-i}\) with static \(8\)-bit weights and \(\hat x_{t'} = 0\) for \(t' < 0\), so \(|\kappa| \le 4\cdot 127^2 < 2^{16}\), not committed; \(y = \tau_{\mathrm{SiLU8}}(\kappa) \in [-127, 127]\) at a static scale.
+\item \(\hat q = \mathsf{L2Unit}(y_q)\) and \(\hat k = \mathsf{L2Unit}(y_k)\) per head (\S\ref{sec:g-l2}); \(\hat v = y_v\). All three are \(8\)-bit at static scales, which is what keeps every scale below off its reduction axis.
+\item \emph{Log-decay}: \(\lambda_t = \tau_\lambda(a_t) \in [-2^{13}, -1]\) per channel, in units of \(2^{-12}\) nats, so the per-step decay \(\gamma = e^{\lambda/2^{12}}\) lies in \([e^{-2}, e^{-2^{-12}}]\). This range is part of \(F\): the upper end bounds the state (below), the lower end bounds the table domains.
+The cumulative log-decay \(\Lambda_t = \sum_{s=c_0}^{t} \lambda_s\), with \(\Lambda_{c_0 - 1} = 0\) and \(|\Lambda| \le 2^{20}\), is virtual: a sumcheck against the public indicator \([c_0 \le s \le t]\), whose multilinear extension the verifier evaluates in \(O(\log S)\).
+\(\Lambda\) at the sub-chunk ends is committed (one value per \(8\) positions), so that \(\Lambda_{B_t - 1}\) and \(\Lambda_{E_s}\) are columns indexed by the high bits of \(t\) or \(s\).
+\end{enumerate}
+
+\emph{Decay tables.} With rounding \(\lfloor \cdot + 1/2 \rfloor\):
+\(\tau_{\mathrm{qd}}(\Delta, x) = \mathrm{round}(x\, e^{\Delta/2^{12}})\) for \(\Delta \in [-2^{16}, 0]\), \(x \in [-127, 127]\) (under \(2^{24}\) rows);
+\(\tau_{\mathrm{dec}}(\Delta) = \mathrm{round}(2^{13} e^{\Delta/2^{12}}) \in [0, 2^{13}]\) for \(\Delta \in [-2^{20}, 0]\);
+\(\tau_{\mathrm{mul8}}(g, x) = \mathrm{round}(x g / 2^{13})\) for \(g \in [0, 2^{13}]\), \(x \in [-127, 127]\) (under \(2^{21}\) rows).
+Every exponent below is a difference \(\Lambda_t - \Lambda_s\) with \(s \le t\), hence \(\le 0\), so every decay factor is at most \(1\).
+The \(\Delta\) inputs of \(\tau_{\mathrm{qd}}\) span at most \(8\) steps, so \(|\Delta| \le 2^{16}\).
+A decay between positions in different sub-chunks is split at sub-chunk boundaries, \(\Lambda_t - \Lambda_s = (\Lambda_t - \Lambda_{B_t - 1}) + (\Lambda_{B_t - 1} - \Lambda_{E_s}) + (\Lambda_{E_s} - \Lambda_s)\), with every part \(\le 0\).
+No factor ever exceeds \(1\), which is why no growth bound or clamp is needed.
+
+\emph{Within a chunk}, for query \(t\) and keys \(s \in [c_0, t]\):
+\begin{enumerate}
+\item \(\tilde q_t = \tau_{\mathrm{qd}}(\Lambda_t - \Lambda_{B_t-1}, \hat q_t)\), \(\tilde k_s = \tau_{\mathrm{qd}}(\Lambda_{E_s} - \Lambda_s, \hat k_s)\), per channel.
+\item Scores. If \(B_s = B_t\): \(x_{tsc} = \tau_{\mathrm{qd}}(\Lambda_{tc} - \Lambda_{sc}, \hat q_{tc})\) and \(A_{ts} = \sum_c x_{tsc} \hat k_{sc}\).
+If \(B_s < B_t\): \(G_{c} = \tau_{\mathrm{dec}}(\Lambda_{B_t - 1, c} - \Lambda_{E_s, c})\), one per sub-chunk pair and channel; \(q^{(E_s)}_{tc} = \tau_{\mathrm{mul8}}(G_c, \tilde q_{tc})\); \(A_{ts} = \sum_c q^{(E_s)}_{tc} \tilde k_{sc}\).
+In both cases \(|A_{ts}| \le 128\cdot 127^2 < 2^{21}\); \(A\) is not committed.
+\item \(\hat A_{t\cdot} = \mathsf{Requant8}(A_{t\cdot})\) over \(s \in [c_0, t]\), with floor \(e_0 = 0\) and exponent \(e^A_t \le 14\); \(o^{\mathrm{in}}_{tj} = \sum_s \hat A_{ts} \hat v_{sj}\), \(|o^{\mathrm{in}}| < 2^{21}\).
+\item Inter-chunk term: \(q^{(0)}_t = \tau_{\mathrm{mul8}}(\tau_{\mathrm{dec}}(\Lambda_{B_t-1}), \tilde q_t)\) (equal to \(\tilde q_t\) in the first sub-chunk, since \(\tau_{\mathrm{dec}}(0) = 2^{13}\)); \(o^{\mathrm{st}}_{tj} = \sum_c q^{(0)}_{tc} \hat H_{cj}\), \(|o^{\mathrm{st}}| < 2^{21}\), where \(\hat H\) is the \(8\)-bit state at \(c_0\) with per-column exponents \(f_j\).
+\item Alignment: with \(f^{\max} = \max_j f_j\) (a selected index per chunk and head) and \(f_t = \max(7 + f^{\max}, e^A_t)\) (a flag and one bound per row),
+\(z_{tj} = \mathsf{ShiftRound}(o^{\mathrm{st}}_{tj},\, f_t - 7 - f_j) + \mathsf{ShiftRound}(o^{\mathrm{in}}_{tj},\, f_t - e^A_t)\), with both shifts in \([0, 20]\) and \(|z| < 2^{22}\) (small-input form of \S\ref{sec:g-sr}).
+\item Output: \(\hat o_t = \mathsf{Requant8}(z_t)\) per head; \(n_t = \mathsf{L2Unit}(\hat o_t)\), which removes the row's exponent (the per-channel gain is fused into \(W_O\)); \(\sigma_t = \tau_{\mathrm{sig}}(g'_t) \in [0, 2^{13}]\); \(m_t = \tau_{\mathrm{mul8}}(\sigma_t, n_t)\) is the \(8\)-bit, static-scale input of the output projection.
+\end{enumerate}
+
+\emph{State at chunk ends.} \(H\) is kept in units of \(2^7\) products \(\hat k \hat v\). At the end \(c_1\) of a complete chunk:
+\begin{gather*}
+k^{\mathrm{end}}_s = \tau_{\mathrm{mul8}}\big(\tau_{\mathrm{dec}}(\Lambda_{c_1} - \Lambda_{E_s}), \tilde k_s\big),\qquad
+\mathrm{KV}_{cj} = \textstyle\sum_{s = c_0}^{c_1} k^{\mathrm{end}}_{sc} \hat v_{sj},\\
+H'_{cj} = \mathsf{MulRound}\big(H_{cj}, \tau_{\mathrm{dec}}(\Lambda_{c_1, c}), 13\big) + \mathsf{ShiftRound}(\mathrm{KV}_{cj}, 7),
+\end{gather*}
+then \(\hat H' = \mathsf{Requant8}\) of each column \(H'_{\cdot j}\), with exponent \(f'_j \in [0, 13]\). \(H = 0\) at position \(0\).
+\(H'\) and \(\hat H'\) are committed: \(2\cdot 64\cdot 128^2\) elements per chunk and layer, \(256\) per position and head.
+\emph{State bound.} \(\Lambda_{c_1} \le -128\) gives \(\tau_{\mathrm{dec}}(\Lambda_{c_1}) \le 7940\), so \(|H'| \le (7940/2^{13})|H| + 1/2 + 16129.5\). By induction over chunks, \(|H| < 16130/0.0307 < 2^{20}\), so \(H \in A\) is a valid input of \(\mathsf{MulRound}\) (\(x \in A\), \(y \le 2^{13}\), \(k = 13\)) and of \(\mathsf{Requant8}\).
+Without the upper end of the decay range the honest state would grow linearly in the context and leave \(A\).
+A chunk that is still open at the end of the sequence produces outputs but no state.
+
+\emph{Cost per position and head} (the cost model's count): \(2{,}191\) lookups into decay tables (\(\tilde q, \tilde k\): \(256\); same-sub-chunk pairs: \(4.5\cdot 128\); \(q^{(E)}\) and \(q^{(0)}\) versions: \(8.44\cdot 128\); \(k^{\mathrm{end}}\): \(128\); \(\tau_{\mathrm{dec}}\) values: \(151\)); \(\mathsf{Requant8}\) of \(64.5\) scores and \(128\) outputs; \(256\) alignment shifts; and, per state element, \(\mathsf{MulRound} + \mathsf{ShiftRound} + \mathsf{Requant8}\) plus one committed \(H\).
+The recurrence (everything after the inputs) is \(21\)--\(23\%\) of GLM-5.3-Flash's work at \(16\)K, where revision~10 had estimated about \(3\%\); GLM-5.3-Flash's rows are \(21\)--\(25\%\) dearer than in revision~10.
+Sub-chunks of \(8\) are the longest for which one \(\tau_{\mathrm{qd}}\) lookup per decayed value fits a \(2^{24}\)-row table; sub-chunks of \(4\) would need \(54\%\) more lookups.
+
+\subsection{Sparse attention with an indexer}
+\label{sec:dsa}
+
+The indexer follows the DeepSeek-style ``lightning'' form assumed for GLM-5.3-Flash: \(I_{mj} = \sum_{h=1}^{32} w_{mh}\, \mathrm{ReLU}(\hat q_{mh} \cdot \hat k_j)\) over pooled keys \(j\).
+Pooled key \(j\) covers tokens \(4j, \ldots, 4j+3\) and is a candidate for query \(m\) only if \(4j + 3 \le m\); the up to three tokens of the query's incomplete pool are always attended.
+The number of candidates \(n_m = \lfloor (m+1)/4 \rfloor\) and the number of slots \(k_m = \min(2048, n_m)\) are public functions of \(m\).
+At constraint level:
+\begin{enumerate}
+\item \(\hat q_{mh}\) is a linear layer's output with RoPE on \(64\) of its \(128\) dimensions (\S\ref{sec:F}), quantized by \(\mathsf{Requant8S}\); \(\hat k_t\) likewise, per token (\(128\) values); \(w_{mh}\) is a \(32\)-wide linear layer's output quantized by \(\mathsf{Requant8S}\). All exponents are static, so the score has one scale.
+\item Pooled key \(\bar k_j = \sum_{i=0}^{3} \hat k_{4j+i}\), \(|\bar k| \le 508\), virtual: pooling is an exact sum of the per-token \(8\)-bit keys and is never rounded.
+\item \(\mathrm{dot}_{mjh} = \sum_c \hat q_{mhc} \bar k_{jc}\), \(|\mathrm{dot}| \le 128\cdot127\cdot508 < 2^{23}\), not committed.
+\item \(c_{mjh} = \mathsf{ShiftRound}(\mathrm{dot}_{mjh}, 12)\), so \(|c| \le 2^{11}\); ReLU by a flag \(o \in \{0,1\}\) with \(o(1-o) = 0\) and one lookup \(o\,c + (1-o)(-c-1) \in \Rng\), so \(o = 1\) exactly when \(c \ge 0\); \(r = o\,c\) is virtual. Cost \((2, 5, 2)\) per (query, key, head), \((2,3,2)\) with the multi-column range table.
+\item \(I_{mj} = \sum_h w_{mh} r_{mjh}\), \(|I| \le 32\cdot 127\cdot 2^{11} < 2^{23}\), so \(I \in A\); \(I\) is virtual and enters \(\mathsf{TopK}\)'s lookup through the claim reduction of the bottom GKR layer, like the softmax input \(\mathrm{acc}\).
+\end{enumerate}
+The top-\(k_m\) set is defined with ties broken by the smaller index and is proved by \(\mathsf{TopK}\) per candidate; the list of selected indices used by attention is tied to the selected set by a multiset (LogUp) argument with multiplicity \(\mathrm{sel}_{mj} \in \{0,1\}\).
+Slots beyond \(k_m\) are masked.
+Attention over the selected keys is \S\ref{sec:attn} restricted to the slots.
+The slot index \(s_{mi}\) is committed as \(\lceil\log_2(S/4)\rceil\) Boolean bits, and the latent (rank-\(512\)) key with its RoPE part and the latent value of slot \(i\) are read through the gather sumcheck of \S\ref{sec:gather} with address \(s_{mi}\); the score claims and the \(PV\) claims on the gathered rows share one such sumcheck per layer, combined by a random coefficient.
+The formats above are fixed choices of \(F\); that they match the deployed indexer (head count, RoPE split, pooling by sum) is an assumption about an architecture whose details are not published.
+If the indexer has no per-head non-linearity, the per-(query, key, head) cost below disappears and only the per-(query, key) cost remains.
+
+\subsection{Sampling}
+\label{sec:sampling}
+
+For generated position \(t\) with logits \(z_{t,\cdot} \in A^{|V|}\):
+\begin{itemize}
+\item \(\theta = 0\): \(y_t\) is the smallest index attaining \(\max_j z_{tj}\). Proof: \(\max = z_{t y_t}\) through the public one-hot of \(y_t\), and for every \(j < |V|\), \(\max - z_{tj} - [j < y_t] \in \Rng\), where \([j<y_t]\) is a public function of the public \(y_t\); padded vocabulary rows carry the minimum logit.
+\item \(\theta > 0\): \(p_{tj} = \tau_{\exp,\theta}(z_{tj} - \max_j z_{tj}) \in [0, 2^{12}]\), so \(Z_t = \sum_j p_{tj} < 2^{12}|V| < 2^{30}\) for \(|V| < 2^{18}\).
+With \(u_t = \mathsf{PRF}(r, t) \in [0, 2^{30})\) and \(w_t = \lfloor u_t Z_t / 2^{30}\rfloor\) (limb gadget, once per token),
+\[
+\textstyle\sum_j [j < y_t]\, p_{tj} \;\le\; w_t \;<\; \sum_j [j \le y_t]\, p_{tj}.
+\]
+Both sums are linear functionals of the committed \(p_{t,\cdot}\) whose coefficient vectors the verifier evaluates in \(O(\log|V|)\).
+\item Top-\(k\): \(p_{tj}\) is multiplied by a \(\mathsf{TopK}\) selector before the sums. Top-\(p\) is not supported.
+\end{itemize}
+The \(12\)-bit probabilities make tokens with probability below about \(2^{-13}\) of the mode unsampleable; this is part of \(F\).
+\(u_t\) is computed by the verifier (one PRF call per generated token).
+
+%======================================================================
+\section{Gadgets}
+\label{sec:gadgets}
+
+\paragraph{Tables.}
+\(\Rng\) is membership in \(R_{24} = [0, 2^{24})\).
+\(T_8 = [0, 255)\).
+\(T_{\mathrm{pow}}\) maps an exponent \(k \in [0, 31]\) to \((2^k, 2^{29-k}, \text{flags})\), and a signed normalization exponent \(E \in [-15, 15]\) to the triple \((2^{\max(E,0)},\ 2^{\max(-E,0)},\ [E \text{ even}])\).
+Non-linear tables (\(\tau_{\mathrm{SiLU}}, \tau_{\exp}, \tau_{\exp,\theta}, \tau_{\mathrm{rsqrt}}, \tau_{\mathrm{recip}}\), router, and for KDA \(\tau_{\mathrm{SiLU8}}, \tau_\lambda, \tau_{\mathrm{sig}}, \tau_{\mathrm{qd}}, \tau_{\mathrm{dec}}, \tau_{\mathrm{mul8}}, \tau_{\mathrm{l2}}\)) have at most \(2^{24}\) rows and are committed in \(C_W\).
+A lookup of a tuple \((a, b)\) is a lookup of \(a + \beta b\) for a challenge \(\beta\); soundness of this compression is in \S\ref{sec:security}.
+\(\Bnd(u, k)\) abbreviates \(\Rng(u) \wedge \Rng(2^k - 1 - u)\), i.e.\ \(u \in [0, 2^k)\) for \(k \le 24\).
+
+\paragraph{Notation for costs.}
+Each gadget lists \((C, \Lambda, R)\): committed base-field elements, lookups, and constraint terms per output element.
+Virtual quantities (linear or quadratic expressions of committed ones) are not committed.
+The cost model uses these counts, rounded up where noted.
+
+\subsection{\texorpdfstring{\(\mathsf{Requant8}\)}{Requant8}: dynamic row quantization}
+\label{sec:g-req}
+
+Input: a row \(a_1,\ldots,a_n \in A\), \(n \le 2^{15}\).
+Canonical rule: \(e\) is the least integer in \([e_0, 17]\) such that every \(a_i \in [-127.5\cdot 2^e, 127.5 \cdot 2^e)\); \(s = 2^e\); \(q_i = \lfloor a_i/s + 1/2 \rfloor\).
+Because the interval is half-open, \(|q_i| \le 127\) always: the honest value never clips.
+\(e_0\) is a per-tensor floor in \(C_W\) that keeps \(k_{mn} \le 24\) in the following \(\mathsf{ShiftRound}\).
+
+Constraints, with \(s\) looked up from \(e\) in \(T_{\mathrm{pow}}\):
+\begin{align*}
+&u_i := 2a_i - 2 s q_i + s, \qquad \Bnd(u_i,\, e+1), \qquad q_i + 127 \in T_8; \\
+&\text{if } e > e_0:\quad w := \begin{cases} 4 a_{j^\ast} - 255 s & \sigma = 1\\ -4 a_{j^\ast} - 255 s - 1 & \sigma = 0\end{cases}\ \ \in [0, 2^{26}) \text{ by two limbs},
+\end{align*}
+where \(j^\ast\) (committed as \(15\) Boolean-constrained bits per row, with \(\Rng(n - 1 - j^\ast)\); \S\ref{sec:g-max}) and \(\sigma\) are per-row witnesses and \(a_{j^\ast} = \sum_i \mathrm{eq}(\mathrm{bits}(j^\ast), i)\, a_i\) is checked by sumcheck.
+The first line forces \(q_i = \lfloor a_i/s + 1/2\rfloor\) and \(|q_i| \le 127\), hence every \(a_i\) fits at \(e\).
+The second line states \(a_{j^\ast} \ge 127.5 \cdot 2^{e-1}\) or \(a_{j^\ast} < -127.5 \cdot 2^{e-1}\): some \(a_i\) does not fit at \(e-1\), hence \(e\) is minimal.
+Cost \((1, 3, 2)\) per element, counted as \((2,3,2)\).
+
+\subsection{\texorpdfstring{\(\mathsf{Requant8S}\)}{Requant8S}: static, saturating}
+\label{sec:g-reqs}
+
+Exponent \(e\) is a constant.
+Witnesses \(q\) and \(o \in \{-1, 0, 1\}\) with \(o^3 = o\):
+\begin{align*}
+& o = 0:\ \ \Bnd(2a - 2sq + s,\ e+1),\ \ q + 127 \in T_8;\\
+& o = \pm 1:\ \ q = 127\,o,\ \ 2 o a - 255 s - [o = -1] \in \Rng.
+\end{align*}
+The three cases are merged into two lookups whose inputs are gated by \(1 - o^2\) and \(o^2\), plus the \(T_8\) lookup.
+Cost \((2, 3, 3)\), counted as \((3,3,3)\).
+
+\subsection{\texorpdfstring{\(\mathsf{ShiftRound}\)}{ShiftRound}}
+\label{sec:g-sr}
+
+Input \(|\mathrm{acc}| < 2^{29}\), shift \(k \in [7, 24]\) (from row and column exponents through \(T_{\mathrm{pow}}\)).
+Output \(c = \lfloor (\mathrm{acc} + 2^{k-1}) / 2^k \rfloor\).
+\[
+u := \mathrm{acc} + 2^{k-1} - 2^k c,\qquad \Bnd(u, k),\qquad \Rng(2^{29-k} + 1 + c),\ \ \Rng(2^{29-k} + 1 - c).
+\]
+The \(c\)-bounds are \(k\)-dependent so that \(|2^k c| \le 2^{29} + 2^{k}\); this is what makes the relation wrap-free (Table~\ref{tab:bounds}).
+Because \(k \ge 7\), \(|c| < 2^{22}+1\) and no saturation is needed.
+Cost \((1, 4, 1)\).
+
+\emph{Small-input form} (KDA alignment): for \(|\mathrm{acc}| < 2^{21}\), any shift \(k \in [0, 20]\) is allowed, with the \(c\)-bounds replaced by \(\Rng(2^{21} + c)\), \(\Rng(2^{21} - c)\); for \(k = 0\) the flag \([k = 0]\) of \(T_{\mathrm{pow}}\) replaces the remainder bound by \(u = 0\) and the rounding constant by \(0\), so \(c = \mathrm{acc}\).
+All terms stay below \(2^{22}\). Same cost.
+
+\subsection{\texorpdfstring{\(\mathsf{MulRound}\)}{MulRound}}
+\label{sec:g-mul}
+
+Input \(x \in A\), \(y\) with \(|y| \le 2^{17}\), shift \(k \in [13, 30]\).
+Output \(c = \mathrm{round}(xy/2^k)\), computed without forming \(xy\):
+\begin{align*}
+& x = 2^{12} x_h + x_l,\ \ x_l \in [0, 2^{12}),\ x_h \in [-2^{11}, 2^{11});\\
+& x_l y = 2^{12} t + v,\ \ v \in [0, 2^{12});\qquad H := x_h y + t,\ \ |H| < 2^{29};\\
+& c = \lfloor (H + 2^{k'-1}) / 2^{k'} \rfloor \text{ with } k' = k - 12 \ge 1, \text{ by the } \mathsf{ShiftRound} \text{ relation on } H.
+\end{align*}
+Dropping \(v/2^{12} \in [0,1)\) does not change the floor because \(H + 2^{k'-1}\) is an integer and \(2^{k'} \ge 2\).
+Witnesses \(x_h, t, c\); lookups for \(x_l, x_h, v\), \(t + 2^{17} \in [0, 2^{18})\), the remainder bound, and the \(c\) bound.
+The bound on \(t\) is required: without it, \((t + 127\cdot 2^{12},\ v + 1)\) also satisfies \(x_l y = 2^{12} t + v\) in \(\Fp\), because \(127 \cdot 2^{24} = p - 1\).
+Cost \((3, 8, 3)\).
+RoPE uses the same decomposition with two products per output that share \(x_h\); each product has its own bounded \(t\).
+
+\subsection{\texorpdfstring{\(\mathsf{NormScale}\)}{NormScale}, \texorpdfstring{\(\mathsf{SatAdd}\)}{SatAdd}, lookups}
+
+\label{sec:g-norm}
+\(\mathsf{Norm}\): given an integer \(X \in [1, 2^{30}]\), a signed exponent \(E\) and a mantissa \(\delta\) with
+\[
+2^{E^-} X = 2^{E^+} \delta + \rho, \qquad E^+ = \max(E, 0),\ E^- = \max(-E, 0),\qquad \Bnd(\rho, E^+),
+\]
+where \((2^{E^+}, 2^{E^-})\) come from \(T_{\mathrm{pow}}\) and the range of \(\delta\) is enforced by the domain of the table that consumes it.
+A left shift (\(E < 0\), \(\rho = 0\)) handles small inputs: the softmax denominator of an early position (\(D = 2^{10}\) for the first token) and a norm row dominated by one channel (\(\Sigma\) as small as \(64^2\)).
+With a right shift only, these inputs had no valid witness and an honest prover failed.
+All terms are below \(2^{30}\).
+
+\(\mathsf{NormScale}\): \(\Sigma = \sum_i q_i^2 + \epsilon_{\mathrm{int}} \in [1, 2^{29})\) with \(\epsilon_{\mathrm{int}} \ge 1\) (sumcheck); \(\mathsf{Norm}\) with \(E\) even in \([-14, 14]\) and \(\delta \in [2^{14}, 2^{16})\); \(\mu = \tau_{\mathrm{rsqrt}}(\delta) \in [2^{14}, 2^{15})\); \(q'_i = \lfloor (q_i\mu + 2^{14})/2^{15}\rfloor\) by \(\Bnd(q_i \mu + 2^{14} - 2^{15} q'_i, 15)\), \(q'_i + 127 \in T_8\).
+The exponent \(E/2\) enters the next shift, and the format constants keep that shift inside the range of the gadget that applies it.
+For the softmax denominator, \(E \in [-5, 15]\) (\([-3, 15]\) with \(12\)-bit probabilities) and \(\delta \in [2^{15}, 2^{16})\).
+Cost \((1, 3, 1)\), counted as \((2,3,1)\).
+
+\label{sec:g-l2}
+\(\mathsf{L2Unit}\) (KDA): input \(y \in [-127,127]^{128}\); output \(\hat y \approx 126.5\, y/\|y\|\) at a static scale, defined exactly by the following steps.
+\(\Sigma = \sum_i y_i^2 + 1 \in [1, 2^{21})\) (sumcheck); \(\mathsf{Norm}\) gives \(\Sigma = 2^E \delta + \rho\) with \(E\) even in \([-14, 6]\) and \(\delta \in [2^{14}, 2^{16})\); \(\mu = \tau_{\mathrm{l2}}(\delta) = \lfloor 126.5\cdot 2^{20}/\sqrt{\delta}\rfloor\); \(\hat y_i = \mathsf{ShiftRound}(y_i \mu,\ 20 + E/2)\), with shift in \([13, 23]\) and \(|y_i\mu| < 2^{27}\).
+Since \(\Sigma < 2^E(\delta + 1)\), \(|y_i|\mu / 2^{20 + E/2} \le 126.5\,(1 + 2^{-15}) < 126.51\), so \(|\hat y_i| \le 127\) without saturation.
+The output's scale does not depend on the input's exponent, so a row with a dynamic exponent leaves at a static one.
+Cost \((1, 4, 1)\) per element, plus one \(\mathsf{Norm}\) and one lookup per row.
+
+\(\mathsf{SatAdd}\): \(s = h + c \in [-2^{24}, 2^{24})\); witnesses \(h'\), \(o \in \{-1,0,1\}\);
+\(h' = (1 - o^2) s + \tfrac{o^2+o}{2}(2^{23}-1) - \tfrac{o^2-o}{2} 2^{23}\);
+one lookup of \((1-o^2)(h' + 2^{23}) + o^2(o s - 2^{23} - [o=-1])\).
+Cost \((2, 1, 2)\).
+
+Table lookup \(b = \tau(a)\): commit \(b\), look up \((a, b)\). Cost \((1,1,0)\).
+
+\subsection{Maxima, top-\texorpdfstring{\(k\)}{k}, and selection}
+\label{sec:g-max}
+
+\emph{Valid positions.}
+Every row \(m\) has a public validity indicator \(\nu_{mj} \in \{0,1\}\) and a public last valid index \(\ell_m\): \(\nu_{mj} = [j \le m]\) for causal attention, \([j < k_m]\) for sparse slots, \([4j + 3 \le m]\) for indexer candidates, and \([j < n]\) for padded rows.
+The verifier evaluates \(\tilde\nu\) and \(\tilde\ell\) at any point in time logarithmic in the row length.
+
+\emph{Selected indices.}
+A selected index \(j^\ast\) (a row maximum here, the minimality witness of \(\mathsf{Requant8}\) and \(\mathsf{ShiftQ8}\), the top-\(k\) boundary \(j_\vartheta\)) is committed as bits \(b_1, \ldots, b_{15}\) with \(b_k(1 - b_k) = 0\) for every \(k\), and \(j^\ast = \sum_k 2^{k-1} b_k\).
+The selected value is \(a_{j^\ast} = \sum_j \mathrm{eq}(b, j)\, a_j\).
+The Boolean constraints are required: for \(b \in \Fp^{15}\) off the cube, \(\sum_j \mathrm{eq}(b, j)\, a_j\) is the row's multilinear extension at \(b\), which a prover can steer to any value by solving for \(b\), while \(j^\ast\) still passes its range check.
+Revision~5 omitted them; a prover could then set a row maximum to any value at or above the true one, which changes the rounding of every probability in the row and hence the output, or claim a larger \(\mathsf{Requant8}\) exponent than the minimal one.
+They cost \(15\) committed bits and \(15\) constraint terms per selected index, under \(0.2\%\) of the work.
+
+\emph{Address indices.}
+The same rule applies to every committed index that addresses data: the expert indices \(e_{ts}\) of MoE products and the sparse-attention slot indices \(s_{mi}\), each committed as \(\lceil \log_2 n \rceil\) Boolean bits for an index range of \(n\) (\(9\) bits for \(288\) routed experts, \(\lceil\log_2(S/4)\rceil \le 18\) for pooled keys), and read by the gather sumcheck of \S\ref{sec:gather}.
+The multiset arguments that tie these indices to \(\mathrm{sel}\) check only the integer \(\sum_k 2^{k-1} b_k\), so without \(b_k(1-b_k) = 0\) a prover keeps the integer and moves the bits off the cube; the gathered row is then a combination of several experts' weights, or of several keys, and the output is forged.
+Revision~6 omitted these bits; they add \(0.7\)--\(0.9\%\) to GLM-5.3-Flash and under \(0.01\%\) to Mixtral.
+The selection sumcheck binds the variables of \(j\) first, where the summand has degree \(2\) and the table has one entry per row element; the remaining rounds, over the row variables, have degree at most \(17\) because \(\mathrm{eq}(b(m), r_j)\) is a product of \(15\) factors that each depend on \(m\), but run over one entry per row.
+Binding the row variables first would make the large phase degree \(17\).
+
+Every selected index \(j^\ast\) below satisfies \(\Rng(\ell_m - j^\ast)\).
+Without this bound a prover may select a masked future key as the maximum, which scales every probability in the row down and changes the output.
+
+\emph{Row maximum} \(M = \max_{j:\, \nu_{mj} = 1} a_j\): the consuming table sees the input
+\[
+z_{mj} = \nu_{mj}\,(a_j - M) + (1 - \nu_{mj})\, z_{\min},\qquad \tau(z_{\min}) = 0,
+\]
+so every valid \(M - a_j \ge 0\) is enforced by the table's domain (for softmax, \(\tau_{\exp}\) is defined only on \((-2^{24}, 0]\)), masked entries produce exactly \(0\), and no separate mask constraint is needed.
+\(M = a_{j^\ast}\) for a committed per-row index \(j^\ast\) with Boolean bits, through the virtual one-hot \(\mathrm{eq}(b, \cdot)\).
+\(M\) is unique even if \(j^\ast\) is not.
+
+\emph{Top-\(k\)} of a row with values in \(A\), ties to the smaller index, \(k_m = \min(k, \#\{j : \nu_{mj} = 1\})\): per row a boundary index \(j_\vartheta\) (with \(\Rng(\ell_m - j_\vartheta)\)) and threshold \(\vartheta = a_{j_\vartheta}\); per element \(\mathrm{sel}_j, d_j \in \{0,1\}\) with \(\mathrm{sel}_j(1 - \nu_{mj}) = 0\), \(d_j(a_j - \vartheta) = 0\), \(\sum_j \mathrm{sel}_j = k_m\), and one lookup
+\[
+\nu_{mj}\Big((1 - d_j)\big[\mathrm{sel}_j(a_j - \vartheta - 1) + (1 - \mathrm{sel}_j)(\vartheta - a_j - 1)\big] + d_j\big[\mathrm{sel}_j(j_\vartheta - j) + (1 - \mathrm{sel}_j)(j - j_\vartheta - 1)\big]\Big) \in \Rng.
+\]
+If \(a_j = \vartheta\), the first bracket is \(-1\) for either value of \(\mathrm{sel}_j\), so \(d_j = 1\) is forced; if \(a_j \ne \vartheta\), \(d_j = 0\) is forced.
+Values above \(\vartheta\) are selected, values below are not, and ties are selected exactly when \(j \le j_\vartheta\).
+The selected set is therefore a prefix of the order (value descending, index ascending) ending at \(j_\vartheta\), and the count fixes it.
+All terms are below \(2^{24}\) because \(a_j, \vartheta \in A\); this is why the indexer score is kept in \(A\) (\S\ref{sec:dsa}).
+Cost \((2, 2, 4)\) per element, including the multiset leaf that ties \(\mathrm{sel}\) to the slot list.
+
+\subsection{No-wrap invariant}
+
+\begin{lemma}[No wrap]
+\label{lem:nowrap}
+Every constraint above, read as a polynomial identity over \(\Z\) in variables that satisfy the range checks it lists, has absolute value below \(2^{30.1} < p\).
+Hence the identity holds in \(\Fp\) if and only if it holds in \(\Z\).
+\end{lemma}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Relation & Largest term & Bound \\
+\midrule
+Product accumulator & \(2^{15} \cdot 127^2\) & \(< 2^{29}\) \\
+\(\mathsf{Requant8}\), \(\mathsf{Requant8S}\) & \(2|a| + 2s\cdot 127 + s\) & \(< 2^{26}\) \\
+\(\mathsf{ShiftRound}\) & \(|\mathrm{acc}| + 2^{k-1} + |2^k c| + u\) & \(< 2^{30.1}\) \\
+\(\mathsf{MulRound}\) & \(|x_h y| + |t|\), then \(\mathsf{ShiftRound}\) on \(H\) & \(< 2^{30.1}\) \\
+\(\mathsf{NormScale}\) sum of squares & \(2^{15}\cdot 127^2\) & \(< 2^{29}\) \\
+Softmax denominator & \(2^{10} S\), \(S \le 2^{20}\) (\(2^{12} S\), \(S \le 2^{18}\)) & \(\le 2^{30}\) \\
+\(PV\) block & \(2^{12}\cdot 2^{10}\cdot 127\) (\(2^{10}\cdot 2^{12}\cdot 127\)) & \(< 2^{29}\) \\
+\(PV\) sum of rounded blocks & \(127\, D_m / 2^{k_m} + 2^8\) & \(< 2^{23}\) \\
+Selection, Boolean bits & \(b_k(1 - b_k)\) & \(< 2\) \\
+\(\mathsf{Norm}\) & \(2^{E^-} X\), \(2^{E^+}\delta + \rho\) & \(\le 2^{30}\) \\
+Top-\(k\) gated bound & \(|a_j - \vartheta| + 1\), \(|j - j_\vartheta| + 1\) & \(< 2^{24}\) \\
+Indexer score before shift & \(128 \cdot 127 \cdot 508\) & \(< 2^{23}\) \\
+Indexer ReLU lookup & \(|c| + 1\), \(|c| \le 2^{11}\) & \(< 2^{12}\) \\
+Indexer weighted sum & \(32 \cdot 2^7 \cdot 2^{11}\) & \(< 2^{23}\) \\
+KDA convolution & \(4 \cdot 127^2\) & \(< 2^{16}\) \\
+KDA cumulative log-decay & \(128 \cdot 2^{13}\) & \(\le 2^{20}\) \\
+KDA scores, \(o^{\mathrm{in}}\), \(o^{\mathrm{st}}\), \(\mathrm{KV}\) & \(128 \cdot 127^2\) & \(< 2^{21}\) \\
+KDA alignment sum & \(|o^{\mathrm{st}}| + |o^{\mathrm{in}}|\) after shifts \(\ge 0\) & \(< 2^{22}\) \\
+KDA state & \((7940/2^{13})|H| + 16130\), invariant & \(< 2^{20}\) \\
+\(\mathsf{L2Unit}\) & \(|y_i \mu|\); \(\Sigma\) & \(< 2^{27}\); \(< 2^{21}\) \\
+Sampling sum & \(2^{12}|V|\), \(|V| < 2^{18}\) & \(< 2^{30}\) \\
+\bottomrule
+\end{tabular}
+\caption{Integer bounds behind Lemma~\ref{lem:nowrap}.}
+\label{tab:bounds}
+\end{table}
+
+\begin{lemma}[Determinism]
+\label{lem:det}
+For inputs in range, each gadget has exactly one satisfying assignment of its outputs, and it equals the definition in \S\ref{sec:F}.
+Free witnesses that do not affect outputs (\(j^\ast\) among tied maxima) do not change any committed output.
+\end{lemma}
+\noindent\emph{Proof sketch.}
+By Lemma~\ref{lem:nowrap}, each relation is an integer relation.
+A remainder in \([0, 2^k)\) determines the quotient; the minimality witness rules out every larger exponent; the overflow flags are forced by which inequality holds; Boolean bits make every selected value an entry of its row, and index bounds confine every selected index to valid positions; the top-\(k\) count with index tie-break determines the selected set; the signed normalization has one mantissa per octave range. Honest inputs lie in every gadget's domain, including the KDA state, whose bound is an invariant over chunks that follows from the decay range (\S\ref{sec:kda}). \(\square\)
+
+%======================================================================
+\section{Cryptographic layer}
+\label{sec:crypto}
+
+\subsection{Fields}
+\label{sec:fields}
+
+\(p = 2^{31} - 2^{24} + 1\) (KoalaBear), with \(p - 1 = 2^{24}\cdot 127\), so \(\Fp^\times\) has multiplicative subgroups of every order \(2^k\), \(k \le 24\).
+Revision~2 used the Mersenne-\(31\) field, whose \(2\)-adicity is \(1\); that forced a circle code, and no analyzed multilinear commitment over circle codes exists.
+\(\Fq = \Fp[X]/(X^4 - 3)\) and \(\Fo = \Fp[X]/(X^8 - 3)\) are fields: for \(p \equiv 1 \pmod 4\), \(X^{2^k} - a\) is irreducible exactly when \(a\) is a non-square, and \(3\) is a non-square mod \(p\).
+\(\Fq \subset \Fo\) through \(Y \mapsto X^2\).
+\(|\Fq| \approx 2^{124}\) and \(|\Fo| \approx 2^{248}\).
+Every bound of Lemma~\ref{lem:nowrap} is below \(2^{30.1} < p \approx 2^{30.99}\).
+The reference script checks these facts numerically.
+Witness data lives in \(\Fp\).
+Challenges are drawn in the smallest field that meets each term of the budget (Table~\ref{tab:budget}):
+\begin{itemize}
+\item \emph{IOP challenges} (zerocheck points, constraint coefficients, sumcheck and GKR rounds, the lookup challenges \((\beta, Z)\), the \(PV\) offset \(\gamma\)) are in \(\Fq\). Each term is at most \(2^{-116}\) per round there, except the lookup term, which reaches \(2^{-103.9}\) with grinding (\S\ref{sec:logup}).
+\item \emph{Commitment challenges} (column batching coefficients, fold challenges, out-of-domain points) are in \(\Fo\). The Johnson-regime proximity bound has a factor of about \(2^{82}/|\F|\), which needs \(|\F| \approx 2^{248}\) to reach \(2^{-166}\).
+\end{itemize}
+Evaluation points produced by the IOP lie in \(\Fq \subset \Fo\), which is all the commitment's evaluation proof requires.
+Revision~3 drew every challenge in \(\Fo\) with one lookup instance (Mode~P8 in \texttt{costmodel.py}).
+Mode~C draws the commitment challenges in \(\Fq\) too and relies on the proximity conjecture; it saves only about \(5\%\) over Mode~P and is not recommended.
+
+\subsection{Polynomial commitment}
+\label{sec:pcs}
+
+Committed vectors are split into columns of at most \(2^{22}\) entries (\(2^{23}\) in profile~O).
+Each column is encoded with a Reed--Solomon code of rate \(1/4\) (profile~O: \(1/2\)) on a multiplicative subgroup of order at most \(2^{24}\), so codewords stay in \(\Fp\).
+A leaf holds all columns of one work unit (\S\ref{sec:protocol}) on one coset of \(4\) codeword positions and is hashed with BLAKE3, so a query opens one leaf and one path per unit; unit subtrees are joined under one root.
+Each unit sends its subtree's cap (the \(2^{\lfloor \log_2 q \rfloor}\) nodes at that level) once, and paths stop at the cap.
+Multilinear evaluations are proved with BaseFold \cite{basefold} over this code, or WHIR \cite{whir}, both analyzed for Reed--Solomon codes, with the first \(2\) folding rounds done before the first committed fold oracle.
+The coset size trades leaf width against tree size: a query opens every column of every unit at the coset, so the leaf data is \(q \times (\text{columns}) \times (\text{coset})\) symbols and dominates both the proof and its recursive verification, while smaller cosets add Merkle nodes to the commitment. Cosets of \(4\) minimize the sum (\(16\) and \(2\) both cost more).
+Many claims on the same column are reduced to one point by a sumcheck; all columns are opened together with independent random coefficients per column (not powers of one coefficient), and columns of different lengths are batched by folding the longer ones first and adding the shorter ones when the lengths meet, as in mixed-degree FRI.
+
+Parameters: \(q = 76\) queries and \(30\) bits of grinding in both modes, for \(103\) bits (\S\ref{sec:recursion} explains the margin).
+Profile~O uses rate \(1/2\) with \(q = 153\) (\S\ref{sec:opt-rate}).
+Grinding \(30\) bits costs about \(10^9\) BLAKE3 compressions, half an H100-second.
+
+\subsection{Sumcheck, zerocheck, products}
+
+Elementwise constraints are tested by a zerocheck: \(\sum_x \mathrm{eq}(\rho, x)\, \mathcal{C}(x) = 0\) for a random \(\rho\), with \(\mathcal{C}\) a fixed polynomial of degree at most \(4\) in committed and virtual columns.
+Different constraint types in one unit are combined with independent random coefficients.
+A matrix product \(C = AB\) is reduced from a claim \(\tilde C(r_x, r_y)\) to claims on \(\tilde A(r_x, \cdot)\) and \(\tilde B(\cdot, r_y)\) by the standard product sumcheck, whose prover cost is \(O(mk + kn)\), not \(O(mkn)\) \cite{thaler}.
+Products with a virtual output (attention scores, the indexer's dot products) take their claim from the gadget that consumes them.
+
+\emph{Gathers.}
+\label{sec:gather}
+A product whose operand row is chosen by a committed index \(e(t)\) with Boolean bits \(b(t)\) (\S\ref{sec:g-max}), such as an expert's weight matrix in MoE or a selected latent key or value in sparse attention, is reduced from its output claim by
+\[
+\textstyle\sum_{t, k} \mathrm{eq}(r_t, t)\, \tilde a(t, k)\, \tilde W\big(b(t), k, r_n\big),
+\]
+where \(\tilde W\) is the multilinear extension of the stacked operand (all experts, or all positions' latent rows) and \(t\) ranges over the (token, expert slot) or (query, slot) pairs.
+On the cube \(\tilde W(b(t), k, r_n) = W_{e(t), k, r_n}\) because \(b(t)\) is Boolean, so the sum is the gathered product.
+The variables of \(k\) are bound first: there the summand has degree \(2\) and the prover's table is the gathered rows \(W_{e(t), \cdot, r_n}\), one pass over the operand.
+The variables of \(t\) follow, with degree at most \(|b| + 2\) (\(11\) for \(288\) experts, \(20\) for \(2^{18}\) pooled keys).
+The sumcheck ends in claims on \(\tilde a\), on each bit column, and on \(\tilde W\) at \((\tilde b(r'_t), r'_k, r_n)\), a point off the cube in the address coordinates, which joins the weight claims (\S\ref{sec:weights}) or the trace claims on the latent columns.
+Nothing is committed beyond the address bits.
+A token's routed experts are separate values of \(t\); the router-weighted combine is \(\mathsf{MulRound}\) on the expert outputs.
+Folding the stacked expert tensor at \(r_n\) is one pass over the routed experts' weights, within the per-proof weight reduction \(c_{\mathrm{wred}}\).
+Revision~6 stated only that such products ``fold the stacked expert tensor at the address variables'', which is sound only with Boolean address bits and this order of binding.
+
+\subsection{Lookups}
+\label{sec:logup}
+
+LogUp \cite{logup} is run as a GKR fractional sum \cite{logupgkr}: leaves \(1/(Z - \ell_i)\) for witness lookups and \(-m_v/(Z - v)\) for table rows.
+No column depends on \(Z\), so every committed column (including the multiplicities \(m_v\)) is fixed before \(Z\) is drawn.
+Each work unit has its own tree per table, whose root fraction is sent in the clear.
+Leaf expressions may be quadratic in committed columns (remainders, gated inputs), which keeps remainders virtual.
+Both modes run one \((Z, \beta)\) instance over \(\Fq\), drawn after an \(11\)-bit grinding nonce.
+Per chunk, a false lookup survives with probability at most \(2D/|\Fq| \approx 2^{-92.9}\), where \(D \le 2^{30} + 2^{25.6}\) is the number of distinct linear forms in the chunk (the factor \(2\) covers a zero denominator); the grinding makes each attempt cost \(2^{11}\) hash calls, so the term is \(2^{-103.9}\) in the convention of Table~\ref{tab:budget}.
+The bound is per chunk because each chunk's root fractions are checked separately: a false lookup lies in some chunk, and that chunk alone must pass.
+Revision~4 computed the term for \(2^{50}\) lookups in one relation (\(2^{-74}\)) and ran two instances; one instance halves the lookup work.
+
+\paragraph{Lookup count bound.}
+LogUp proves multiset inclusion only modulo the characteristic: \(p\) copies of a value outside the table contribute \(p/(Z - v) = 0\).
+A single proof makes \(10^{11}\)--\(10^{14}\) lookups, \(50\) to \(10^5\) times \(p\), so this is a real attack, not a corner case.
+Lookups into each table are therefore split into chunks of at most \(2^{30} < p\) lookups along unit boundaries, and each chunk has its own multiplicity column (entries below \(2^{30}\)) and its own table-side tree.
+The verifier checks that, for every chunk, the root fractions of its units and its table side sum to zero.
+The table side costs \(|T|\) leaves per chunk, about \(N |T| / 2^{30}\) in total: \(1\)--\(2\%\) of the lookup work for \(2^{24}\)-row tables and \(3\)--\(5\%\) for the \(2^{25.6}\)-row range table of profile~O.
+Smaller tables (two-limb range checks against a \(2^{12}\)-row table) trade this for one more lookup per bound.
+
+\subsection{Transcript and phases}
+
+The Fiat--Shamir state starts as \(\mathsf{H}(\texttt{LLM-SUMCHECK-v5} \| \mathsf{mode} \| \mathsf{policy} \| C_W \| h_{\mathrm{circ}} \| \mathsf{H}(x) \| \mathsf{H}(y) \| n_c \| S \| \mathsf{salt})\), where \(h_{\mathrm{circ}}\) is the digest of the circuit description (layer list, shapes, gadget formats, unit partition rule) that the verifier executes.
+\(\mathsf{salt}\) is \(256\) random bits chosen by the prover and given only to the request's own verifier.
+It is required when weight openings are shared (\S\ref{sec:weights}); otherwise it may be zero.
+A prover-chosen value absorbed before the first commitment gives the prover nothing beyond what retrying commitments gives, which the factor \(Q\) of the soundness theorem already covers.
+Challenges are drawn in this order, each after everything it tests is in the transcript:
+\begin{enumerate}
+\item trace root (all witness columns and multiplicities), then an \(11\)-bit grinding nonce;
+\item \((\beta, Z)\), constraint coefficients, zerocheck points (in \(\Fq\));
+\item sumcheck and GKR round challenges, one per round, after each round message (in \(\Fq\));
+\item per-column point-reduction coefficients (in \(\Fq\)) and opening coefficients (in \(\Fo\)), after all claims are in the transcript;
+\item fold challenges after each fold oracle (in \(\Fo\)); query positions after the last oracle and a \(30\)-bit grinding nonce.
+\end{enumerate}
+Field elements are derived by rejection sampling from the hash output, \(31\) bits per coordinate.
+
+\subsection{Zero knowledge (optional mode)}
+\label{sec:zk}
+
+Needed if \(W\) is secret, if a third-party verifier must not learn evaluations of the trace, or if one proof covers several users' requests (\S\ref{sec:protocol}).
+\emph{Open.} Revision~2 specified Libra-style randomization off the Boolean cube by \(\sum_i x_i(1-x_i) R_i\); that makes committed polynomials quadratic in each variable, which a multilinear commitment cannot open, so the mode as written did not work.
+A working mode needs at least:
+\begin{itemize}
+\item salted Merkle leaves, and a salted \(C_W\) (an open-weight deployment can additionally publish the unsalted one);
+\item a hiding multilinear commitment: random message symbols in every column, at least as many as the positions any query or fold reveals, and an evaluation proof that reveals only a masked combination of each claim;
+\item masked sumcheck and GKR round messages in the style of Chiesa--Forbes--Spooner \cite{cfs}, with the mask polynomials committed in the same commitment;
+\item blinded root fractions: per-unit roots reveal sums of \(1/(Z - \ell_i)\) over a unit's lookups, so only per-chunk totals may be sent.
+\end{itemize}
+Each piece is standard, but their combination with this commitment and the streamed units needs its own analysis.
+No overhead is included in the tables.
+
+%======================================================================
+\section{Weights and model identity}
+\label{sec:weights}
+
+\(C_W\) is computed once by a published, deterministic program \(\mathcal{Q}\): BF16 checkpoint \(\to\) fused rotations and norm gains \(\to\) per-column power-of-two quantization \(\to\) format constants and tables \(\to\) commitment.
+For open weights anyone recomputes \(C_W\); for closed weights \(C_W\) is the provider's public commitment and its identity rests on outside attestation.
+\(\mathcal{Q}\) is deterministic only given all its inputs: learned rotations (SpinQuant rotations are trained, not derived), the calibration set and procedure behind the static exponents, the fractional-bit assignment, and the table generators.
+These are published with \(\mathcal{Q}\).
+Because different calibrations give different functions, several \(C_W\) can claim the same model name; a public registry that maps each model release to one canonical \((C_W, h_{\mathrm{circ}})\), with its accuracy report against the BF16 model (\S\ref{sec:limits}), is part of the deployment.
+Clients pin the registry entry, not a name.
+
+The weight codeword (rate \(1/4\), \(16\) bytes per weight) and its Merkle tree are stored on local NVMe, about \(5\)\,TB for a \(320\)B-parameter model.
+A proof needs only query-position leaves from this store.
+The weight claims of a proof are reduced to one point by a sumcheck over the stacked weights, and that point is opened by folding the message, not the codeword, then encoding the folded message.
+The reduction needs the weights in GPU memory and an \(\Fq\) table that shrinks each round; its first rounds are streamed so the table is materialized only once it fits.
+The model charges \(c_{\mathrm{wred}} = 2\times 10^{-11}\) H100-seconds per stored weight for the reduction and \(c_{\mathrm{wopen}} = 2\times 10^{-11}\) for the fold, encoding and opening, together about \(2.8\) seconds on the eight-card node for GLM-5.3-Flash.
+By default every proof pays both.
+
+\paragraph{Shared weight opening (optional).}
+For short requests on large-weight models the weights are a large share of the proof (about half for a \(1\)K-token GLM-5.3-Flash request).
+Several independent proofs may share the opening, though not the reduction, without sharing a trace:
+\begin{enumerate}
+\item each proof \(i\) runs to the point where its weight claims are reduced to one pair \((\rho_i, v_i)\), with \(v_i = \tilde W(\rho_i)\) claimed, and stops;
+\item the batch transcript absorbs the list \(((\rho_i, v_i))_{i \le B}\) and draws coefficients \(\alpha_i \in \Fq\);
+\item one sumcheck reduces \(\sum_i \alpha_i \tilde W(\rho_i)\) to a single point, which is opened once against \(C_W\).
+\end{enumerate}
+Soundness: if some \(v_i\) is false, the combined claim is false except with probability \(1/|\Fq|\) over \(\alpha\), because \(\alpha\) is drawn after every pair is fixed.
+This holds whatever the other proofs contain.
+The verifier of request \(i\) needs only the list of pairs and the batch transcript, a few KiB, not the other proofs.
+Privacy: the list reveals \(B\) points and weight evaluations.
+\(\rho_j\) is a hash output of proof \(j\)'s transcript, which starts with proof \(j\)'s secret salt, so other verifiers cannot test guesses of \(x_j\) against it.
+For open weights \(v_j\) is computable by anyone from \(\rho_j\).
+For closed weights the list reveals \(B\) evaluations of \(W\) per batch; non-ZK proofs already reveal one each.
+Gain: step~1 still costs each proof one pass over the weights, so only \(c_{\mathrm{wopen}}\) is divided by the batch size; a \(1\)K-token GLM-5.3-Flash proof falls from \(6.5\) to \(5.2\) seconds with batches of \(16\), and longer requests gain under \(10\%\).
+Revision~4 divided the reduction too and overstated the gain.
+Sharing the reduction as well would need the batch to combine every proof's raw per-matrix claims, which is not specified here.
+Costs: proofs wait for their batch to fill, and a proof is valid only together with its batch record.
+A compressed proof verifies the batch record inside its first layer, so recursion starts only after the batch closes.
+A main proof regenerated later for an audit cannot rejoin its batch and pays its own opening.
+Every model version that may still be audited keeps its codeword (about \(5\)\,TB for \(320\)B parameters at rate \(1/4\), \(2.6\)\,TB at rate \(1/2\)) for the length of the audit window.
+
+%======================================================================
+\section{Protocol}
+\label{sec:protocol}
+
+A \emph{work unit} is one layer's token mixer or MLP for a slice of heads or experts, sized so that its witness and sumcheck tables fit in at most \(16\)\,GB.
+Units make the prover streamable: the full witness of a \(16\)K proof is \(0.3\)--\(4\times 10^{12}\) field elements (\(1\)--\(16\)\,TB) and is never resident.
+The layer-boundary residual tensors take \(S \cdot d \cdot L \cdot 4\) bytes of host memory: \(135\)\,GB for Llama~3.1~405B at \(16\)K and about \(770\)\,GB for GLM-5.3-Flash at \(1\)M tokens.
+
+\paragraph{Tenancy.}
+By default a proof covers the requests of one client, and every public input in its transcript belongs to that client.
+A \emph{multi-tenant} proof covers several clients' requests in one trace (the \(4\times 4\)K rows of \S\ref{sec:proj}); the shared weight opening of \S\ref{sec:weights} is not multi-tenant, because the proofs share only weight claims.
+Each verifier then sees the other requests' statements and evaluations of a trace that mixes their data, and \(\mathsf{H}(x)\) of a short, low-entropy prompt can be inverted by guessing.
+Multi-tenant proofs therefore require the ZK mode and salted statement digests \(\mathsf{H}(\mathrm{salt}_i \| x_i)\), with the one-hot columns of other clients' tokens committed instead of public.
+Until the ZK mode is specified (\S\ref{sec:zk}), multi-tenant proofs are allowed only for a single client's batch.
+
+\begin{algorithm}[h]
+\caption{\(\mathsf{Prove}\)}
+\begin{algorithmic}[1]
+\State Derive \(r\) from \(n_c\); evaluate \(F\) unit by unit; keep layer-boundary residual tensors in host memory
+\State For each unit: build witness columns, encode, hash into the unit subtree; keep subtree caps; accumulate multiplicities
+\State Commit multiplicities; publish the trace root
+\State Grind \(11\) bits; draw \((\beta, Z)\), coefficients, zerocheck points
+\For{each unit}
+  \State Recompute its witness from the boundary tensors and \(W\)
+  \State Run its zerocheck, product sumchecks, and LogUp-GKR trees; record its claims and root fractions
+\EndFor
+\State Table-side GKR over the multiplicities
+\State Reduce claims per column to one point (one more recompute pass); batch all columns
+\State Recompute codeword values at query positions; produce the folding proof; open \(C_W\) at the weight point, or pass \((\rho, v)\) to the shared opening
+\State Prove the verifier of this proof recursively (\S\ref{sec:recursion}); deliver the compressed proof
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{\(\mathsf{Verify}\)}
+\begin{algorithmic}[1]
+\State Check the registry entry for \((C_W, h_{\mathrm{circ}})\), the receipt signature, and the decomposition of \(x\) (\S\ref{sec:statement})
+\State Recompute \(r\) and the transcript; check the policy, that \(|x| + |y| = S\), and the termination rule on \(y\)
+\State Check every sumcheck and GKR round; check that the root fractions of every lookup chunk sum to zero
+\State Evaluate the public polynomials at the final points: validity indicators \(\nu\) and last indices \(\ell\), \([j < y_t]\), one-hots of \(x\) and \(y\), \(u_t\)
+\State Check the final claims against the opened evaluations
+\State Check the folding proof, the Merkle caps and paths, both grinding nonces, and the \(C_W\) opening (or the batch record)
+\end{algorithmic}
+\end{algorithm}
+\noindent Given a compressed proof, steps 2--6 are replaced by verifying the final recursive proof against the public statement, with the outer-circuit digest \(h_{\mathrm{rec}}\) taken from the registry entry; step 1 stays with the client.
+
+%======================================================================
+\section{Security}
+\label{sec:security}
+
+\begin{theorem}[Soundness, skeleton]
+If \(y \ne F(W, x, r)\) for every \(W\) that \(C_W\) opens to, then the verifier accepts with probability at most the sum of the terms in Table~\ref{tab:budget}, in the random-oracle model, against a prover making \(Q\) oracle queries, up to the factor \(Q\) from Fiat--Shamir applied to a round-by-round sound IOP.
+\end{theorem}
+\noindent\emph{Argument.}
+By Lemmas~\ref{lem:nowrap} and \ref{lem:det}, any trace that satisfies every constraint over \(\Fp\) is the unique integer execution of \(F\), so a false \(y\) violates some constraint.
+A violated elementwise constraint makes the zerocheck sum non-zero except with probability \(\le n\deg/|\F|\) over \(\rho\); a false sumcheck or GKR claim survives a round with probability \(\le \deg/|\F|\); a lookup outside its table survives LogUp with probability \(\le 2(N_{\mathrm{distinct}} + |T|)/|\F|\), with \(N_{\mathrm{distinct}}\) counted in its own chunk, because the cleared identity has degree at most the number of distinct linear forms \(Z - a - \beta b\); and a committed oracle far from the code, or an opening inconsistent with it, survives the PCS with the stated PCS error. \(\square\)
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.32\linewidth}p{0.31\linewidth}p{0.31\linewidth}@{}}
+\toprule
+Term (per round, worst case) & Mode P (IOP in \(\Fq\), commitment in \(\Fo\)) & Mode C (all in \(\Fq\)) \\
+\midrule
+Sumcheck / GKR round, degree \(\le 4\) & \(2^{-122}\) & \(2^{-122}\) \\
+Selection sumcheck, row rounds, degree \(\le 17\) & \(2^{-119.9}\) & same \\
+Gather sumcheck, address rounds, degree \(\le 20\) & \(2^{-119.7}\) & same \\
+State-tree proximity, unique decoding, one batched test per turn (session mode, \S\ref{sec:incr}) & \(2^{-116.3}\) (\(208\) queries \(+ 30\) bits) & same \\
+Zerocheck point, \(\le 48\) variables & \(2^{-116}\) & \(2^{-116}\) \\
+LogUp with \(\beta\)-compression, per chunk of \(\le 2^{30}\) lookups & \(2^{-92.9}\), with \(11\) bits of grinding \(2^{-103.9}\) & same \\
+Shared weight opening (optional) & \(2^{-124}\) & same \\
+Batching of columns (independent coefficients, \(\Fo\)) & within the proximity-gap term & conjectured \\
+Proximity gap, codeword \(\le 2^{24}\) & \(\approx 2^{-166}\) (rate \(1/4\)), \(2^{-164}\) (rate \(1/2\)), Johnson regime \cite{bciks} & conjectured, as in ethSTARK/Plonky3 \\
+Queries & \(76 \times 0.97\) bits \(+\ 30\) grinding \(= 103.8\) (rate \(1/2\): \(153 \times 0.48 + 30 = 103.4\)) & same count \\
+\midrule
+Security level & \(103\) bits per proof, \(100\) bits with recursion, proven bounds & same, conjectured \\
+\bottomrule
+\end{tabular}
+\caption{Soundness budget. ``Bits'' follows the STARK convention: \(Q\) oracle queries succeed with probability at most \(Q\cdot 2^{-\lambda}\).}
+\label{tab:budget}
+\end{table}
+
+Drawing any challenge in \(\Fp\) instead of the extension is a break, not a tuning choice.
+Mode~C relies on the same conjecture as deployed STARKs, and recent work has weakened confidence in the most aggressive (up-to-capacity) versions of it; Mode~C uses the Johnson-radius query count and conjectures only the field term.
+Mode~P is the default; in this model it costs only about \(1.06\times\) Mode~C, because the IOP terms are the same in both modes and only the commitment differs.
+Grinding is used only where a term is within \(11\) bits of the target; it cannot replace the extension field for the per-round terms, which would need tens of bits per round.
+The chunk bound of \S\ref{sec:logup} is a soundness condition, not part of this budget: with more than \(p\) lookups in one relation, the error is \(1\), not \(N/|\F|\).
+
+%======================================================================
+\section{Cost model}
+\label{sec:cost}
+
+\subsection{What dominates}
+
+The forward pass is INT8 tensor-core work and is under \(2\%\) of the proof, even counted four times (trace, sumcheck recompute, point reduction, query recompute).
+The proof is dominated by three per-element costs: committing a base-field element, one lookup leaf, and one zerocheck term.
+At \(16\)K tokens these are, for Llama~3.1~8B, \(51\%\), \(32\%\) and \(14\%\) of the work; for GLM-5.3-Flash, \(49\%\), \(39\%\) and \(6\%\).
+
+\subsection{Unit costs}
+
+H100 SXM rates used: \(3.35\)\,TB/s HBM; about \(1.7\times 10^{13}\) INT32 operations/s (\(64\) INT32 lanes per SM); an \(\Fp\) multiply at about \(5\) integer operations, plus \(10\%\) for the Montgomery reduction of KoalaBear against Mersenne-\(31\) (applied to \(c_{\mathrm{lookup}}\) and \(c_{\mathrm{rel}}\)); an \(\Fq\) multiply at \(9\) base multiplies plus additions, an \(\Fo\) multiply at about \(27\); BLAKE3 at about \(120\)\,GB/s.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{0.25\linewidth}ccp{0.42\linewidth}@{}}
+\toprule
+Unit & Mode P & Mode C & Composition \\
+\midrule
+\(c_{\mathrm{commit}}\) per committed element & \(3.9\times 10^{-10}\) & \(3.5\times 10^{-10}\) & encode twice, hash \(4\) symbols, batch combination (in \(\Fo\) for Mode~P); \(60\%\) efficiency \\
+\(c_{\mathrm{lookup}}\) per lookup leaf & \(1.5\times 10^{-10}\) & \(1.5\times 10^{-10}\) & GKR fractional sum in \(\Fq\), \(\approx 20\) multiplies per leaf, one instance \\
+\(c_{\mathrm{rel}}\) per zerocheck term & \(5.5\times 10^{-11}\) & \(5.5\times 10^{-11}\) & first round in \(\Fp\), later rounds in \(\Fq\) \\
+\(c_{\mathrm{mac}}\) per model MAC & \multicolumn{2}{c}{\(8\times 10^{-15}\)} & four INT8 passes at \(50\%\) of dense peak \\
+\(c_{\mathrm{wred}}\) per stored weight, per proof & \multicolumn{2}{c}{\(2\times 10^{-11}\)} & claim reduction to one point \\
+\(c_{\mathrm{wopen}}\) per stored weight, per opening & \multicolumn{2}{c}{\(2\times 10^{-11}\)} & message fold, folded encoding, opening \\
+\bottomrule
+\end{tabular}
+\caption{Unit costs in H100-seconds. Band: \([0.5\times, 2\times]\) on every entry. Revision~3's Mode~P (all challenges in \(\Fo\)) had \(c_{\mathrm{lookup}} = 4.1\times 10^{-10}\) and \(c_{\mathrm{rel}} = 1.4\times 10^{-10}\); revision~4's two lookup instances had \(c_{\mathrm{lookup}} = 2.75\times 10^{-10}\). One instance is charged at \(0.55\times\) two, because computing the leaf values is shared.}
+\label{tab:units}
+\end{table}
+
+Work for one proof of \(B\) sequences of length \(S\) is
+\begin{align*}
+T_{\mathrm{H100}} = {} & c_{\mathrm{commit}}\, \mathcal{C} + c_{\mathrm{lookup}}\, \Lambda + c_{\mathrm{rel}}\, \mathcal{R} + c_{\mathrm{mac}}\, \mathcal{M} + (c_{\mathrm{wred}} + c_{\mathrm{wopen}}/B_W) N_{\mathrm{total}} \\
+& + (c_{\mathrm{commit}} + c_{\mathrm{lookup}})\big(|T_{\mathrm{all}}| + |T_{\max}| (\lceil \Lambda / 2^{30} \rceil - 1)\big) + c_{\mathrm{node}}\, U (2^{22} - 2^{20}),
+\end{align*}
+where \(\mathcal{C}, \Lambda, \mathcal{R}\) are the sums of the gadget counts of \S\ref{sec:gadgets} over every element of the trace, \(B_W\) is the shared-opening batch size (\(1\) by default), the second line's first term is the table side, including the extra chunks of \S\ref{sec:logup} charged at the largest table (an upper bound), and the last term hashes the Merkle nodes that cosets of \(4\) add over cosets of \(16\) in each of the \(U\) unit subtrees (\(c_{\mathrm{node}}\): one \(64\)-byte compression at \(72\)\,GB/s).
+Per token and layer these are linear in \(d\), \(d_{\mathrm{ff}}\) and the attention width; per sequence, full attention adds \(L\, n_h (S^2/2 + 64S)\) softmax entries; GLM-5.3-Flash adds KDA terms linear in \(S\), indexer terms in \(S^2/8\) per layer, and \(64\cdot 2048\) slots per query per sparse layer.
+\texttt{costmodel.py} contains every count and prints every table below.
+
+\subsection{Machines}
+
+\emph{Eight RTX PRO 6000 Blackwell} (PCIe, no NVLink): each card is taken as \(0.75\) H100 for this workload (band \(0.5\)--\(1.2\)).
+Its memory bandwidth is \(0.53\times\) an H100's, and its integer ALU throughput is higher; the earlier draft's \(1.87\times\) per card came from FP32 peaks, which this workload does not use.
+Placement efficiency is \(0.80\) for dense models and \(0.75\) for MoE, so the node is \(4.8\) or \(4.5\) H100-equivalents.
+Work units are independent after the commit phase, so cross-card traffic is the forward pass's expert dispatch plus a few hundred bytes per sumcheck round.
+
+\subsection{Sanity check against a published figure}
+
+Attestable reports \(53\) tokens/s for a dense \(31\)B model (Gemma~4~31B) at batch-one \(16\)K on one H100, with an unpublished design \cite{attestable}.
+This model projects \(27\) tokens/s for Qwen2.5-32B under the same conditions with the baseline gadgets, about \(2\times\) slower.
+A gap of that size is plausible: the published system proves non-linear layers differently, and Gemma~2 and~3 use sliding-window attention in most layers; if Gemma~4 does too, most of its \(S^2\) term disappears, while the projection here assumes full attention in every layer.
+The comparison does not calibrate this model; it shows that the baseline projections are not optimistic relative to the only public measurement.
+Section~\ref{sec:opt} shows which changes close most of the gap.
+
+%======================================================================
+\section{Optimized profile}
+\label{sec:opt}
+
+The optimized profile (profile~O) keeps the protocol, the security argument and the parameters of \S\ref{sec:crypto}--\S\ref{sec:security}, except that the code rate becomes \(1/2\) (\S\ref{sec:opt-rate}).
+It changes the prover in five ways.
+Two of them (fused gadgets) also change the function: profile~O proves \(F_O\), defined below, under the version tag \texttt{LLM-SUMCHECK-v5-O}.
+A deployment picks one profile per model, and \(C_W\) commits to it.
+
+\subsection{Multi-column range table}
+\label{sec:opt-tuple}
+
+The baseline checks most bounds with two lookups into \(R_{24}\), one for each side.
+Profile~O uses one tagged table
+\begin{align*}
+T_R = {} & \{(k, v) : 0 \le k \le 24,\ 0 \le v < 2^k\}
+\ \cup\ \{(\star_8, v) : 0 \le v < 255\}
+\ \cup\ \{(\star_9, v) : 0 \le v < 361\} \\
+& \cup\ \{(\diamond_k, v) : 7 \le k \le 24,\ 0 \le v \le 2^{30-k} + 2\},
+\end{align*}
+looked up as the compressed tuple \(\mathrm{tag} + \beta v\).
+A remainder bound \(u \in [0, 2^k)\) becomes the single lookup \((k, u)\).
+The \(k\)-dependent quotient bound of \(\mathsf{ShiftRound}\), \(|c| \le 2^{29-k} + 1\), becomes the single lookup \((\diamond_k, c + 2^{29-k} + 1)\).
+\(T_R\) has about \(2^{25.6}\) rows, and every non-linear table grows by a tag column in the same way, so the table side of LogUp costs about \(8\times\) the baseline's.
+At \(10^{11}\) or more lookups per proof that is under \(1\%\) of the work.
+Soundness of the tagged compression is the LogUp term of Table~\ref{tab:budget}: distinct tuples give distinct linear forms \(Z - \mathrm{tag} - \beta v\).
+
+With \(T_R\): \(\mathsf{Requant8}\) costs \((1,2,2)\), \(\mathsf{Requant8S}\) \((2,2,3)\), \(\mathsf{NormScale}\) \((1,2,1)\), \(\mathsf{ShiftRound}\) \((1,2,1)\), \(\mathsf{MulRound}\) \((3,5,3)\).
+
+\subsection{Fused gadgets and the function \texorpdfstring{\(F_O\)}{F\_O}}
+\label{sec:opt-fused}
+
+In the baseline, every accumulator is rounded to a committed \(24\)-bit value and then re-quantized.
+Most of those intermediates have one consumer.
+Profile~O takes the accumulator straight to that consumer.
+
+\paragraph{\(\mathsf{ShiftQ8S}\): accumulator to static saturating \(8\)-bit (\(Q\), \(K\), \(V\)).}
+Input \(|\mathrm{acc}| < 2^{29}\), combined shift \(k \in [1, 22]\), \(s = 2^k\).
+Output \(q = \mathrm{clip}(\lfloor \mathrm{acc}/s + 1/2 \rfloor, -127, 127)\), with witnesses \(q\), \(o \in \{-1,0,1\}\), and a limb \(w_h\):
+\begin{align*}
+& o = 0:\quad (k,\ \mathrm{acc} + s/2 - s q) \in T_R,\quad (\star_8,\ q + 127) \in T_R;\\
+& o = \pm 1:\quad q = 127\,o,\quad w := o\,\mathrm{acc} - 255\cdot 2^{k-1} - [o = -1] = 2^{15} w_h + w_l,\quad (15, w_l), (15, w_h) \in T_R.
+\end{align*}
+The two lookups are shared between branches by gating their inputs with \(1-o^2\) and \(o^2\).
+Bound: \(|\mathrm{acc}| + s/2 + 127 s + s < 2^{29} + 2^{29.1} < 2^{30.1}\) for \(k \le 22\).
+Cost \((3, 2, 3)\).
+\(F_O\) differs from \(F\) here: \(F\) rounds twice (to \(24\) bits, then to \(8\)), \(F_O\) once.
+
+\paragraph{\(\mathsf{RoPE8}\): rotation in the \(8\)-bit domain.}
+\(r = \lfloor (q_1 \cos - q_2 \sin + 2^{14}) / 2^{15} \rfloor\) on \(8\)-bit \(q\) and \(16\)-bit public \(\cos, \sin\), so \(|r| \le 180\).
+Constraints: \((15,\ q_1 \cos - q_2\sin + 2^{14} - 2^{15} r) \in T_R\), \((\star_9,\ r + 180) \in T_R\).
+Bound \(< 2^{23}\); no limb split.
+Scores then satisfy \(|\mathrm{acc}| \le 128 \cdot 180^2 < 2^{22}\), inside the domain of \(\tau_{\exp}\).
+Cost \((1,2,1)\), against \((3,8,3)\) for \(\mathsf{MulRound}\) on \(24\)-bit values.
+\(r\) needs \(9\) bits, so serving kernels cannot feed it to INT8 tensor cores (\S\ref{sec:serving}).
+\(F_O\) differs from \(F\): it rotates after quantization.
+
+\paragraph{\(\mathsf{ShiftLUT}\): accumulator to table output (MLP gate).}
+\(c = \lfloor (\mathrm{acc} + 2^{k-1})/2^k \rfloor\), \(b = \tau(c)\).
+The table carries the quotient bound: rows \((\diamond_k, c, \tau(c))\) for \(7 \le k \le 24\) and \(|c| \le 2^{29-k}+1\), about \(2^{24}\) rows.
+Constraints: \((k, \mathrm{acc} + 2^{k-1} - 2^k c) \in T_R\) and \((\diamond_k, c, b) \in \tau\).
+\(c\) and \(b\) are committed; \(b\) is a \(16\)-bit value.
+Cost \((2,2,1)\), against \((2,5,1)\) for \(\mathsf{ShiftRound}\) followed by a lookup.
+\(F_O\) equals \(F\) here.
+
+\paragraph{\(\mathsf{ShiftQ8}\): accumulator to dynamic \(8\)-bit (MLP up projection).}
+The canonical rule of \S\ref{sec:g-req}, applied to the row of accumulators with \(e \in [\max(2, e_0), 22]\), \(s = 2^e\):
+\((e, \mathrm{acc}_i + s/2 - s q_i) \in T_R\), \((\star_8, q_i + 127) \in T_R\); minimality by the selected \(\mathrm{acc}_{j^\ast}\) (Boolean bits and index bound as in \S\ref{sec:g-max}) with \(w = \pm \mathrm{acc}_{j^\ast} - 255 \cdot 2^{e-2} - [\sigma = 0] \ge 0\), split into two \(15\)-bit limbs, once per row.
+Bound \(< 2^{30.1}\).
+Cost \((1,2,2)\).
+
+\paragraph{Gated MLP in \(F_O\).}
+\(a = \tau_{\mathrm{SiLU}}(\cdot)\) by \(\mathsf{ShiftLUT}\) (\(16\)-bit), \(q^{\mathrm{up}} = \mathsf{ShiftQ8}(\mathrm{acc}^{\mathrm{up}})\), and the product \(m = a\, q^{\mathrm{up}}\) with \(|m| < 2^{22}\) is \emph{virtual}: the down projection's \(\mathsf{Requant8}\) reads it directly.
+Per element of \(d_{\mathrm{ff}}\), the cost falls from \((8, 20, 7)\) to \((4, 6, 5)\).
+Because \(d_{\mathrm{ff}} \approx 3.5 d\), this is the largest single saving.
+\(F_O\) differs from \(F\): the up projection is quantized to \(8\) bits before the product.
+
+\paragraph{Considered and rejected: fusing the residual add.}
+Rounding the sublayer output and adding it to the residual in one gadget still needs the quotient bound on the rounded value, and \(\mathsf{SatAdd}\)'s lookup bounds it only to \(2^{25}\), which does not prevent wrap for \(k \ge 6\).
+It saves nothing and is not used.
+
+\subsection{One fewer relation per softmax entry}
+
+The baseline charges three constraint terms per softmax entry: the max selector, the \(PV\)/\(D\) product, and the validity gate in the lookup input.
+The validity indicator is non-trivial only on the \(S/128\) diagonal tiles of each head, so profile~O evaluates the gated input only there and uses \(a_j - M\) directly elsewhere.
+Softmax entries cost \((1,1,2)\).
+
+\subsection{Rate-\texorpdfstring{\(1/2\)}{1/2} code}
+\label{sec:opt-rate}
+
+Hashing the codeword is the largest part of commitment cost.
+At rate \(1/2\), each committed element is hashed as two symbols instead of four, and encoding writes half as much; the model charges \(0.6\times\) the baseline \(c_{\mathrm{commit}}\).
+Queries grow to keep \(103\) bits: each query gives \(\log_2 1/(\sqrt{1/2} + \eta) \approx 0.48\) bits, so \(q = 153\) with \(30\) bits of grinding, in both modes by the same Johnson-radius count.
+The proximity-gap term is about \(2^{-164}\) for codewords of at most \(2^{24}\) symbols in \(\Fo\).
+Columns grow to \(2^{23}\) entries, so codewords keep the maximal smooth domain of \(2^{24}\).
+The query part of the proof roughly doubles.
+
+\subsection{Small-value sumcheck and GKR}
+
+All witness entries are integers below \(2^{24}\).
+In the first rounds of each zerocheck and product sumcheck, and in the first layers of each LogUp-GKR tree, the round polynomials can be computed from base-field (or plain integer) tables, deferring extension-field multiplications to later rounds, where the tables have shrunk.
+The techniques are univariate skip and small-value sumcheck \cite{gruen,smallsc}.
+The model charges \(0.5\times\) the baseline \(c_{\mathrm{rel}}\) and \(0.7\times\) the baseline \(c_{\mathrm{lookup}}\).
+These two factors are estimates and should be replaced by measurement first.
+
+\subsection{Effect}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Qwen2.5-32B shape, one H100 & \(16\)K, one sequence & \(4\times 4\)K \\
+\midrule
+Baseline profile, all challenges in \(\Fo\) (revision~3) & 15.6 & 23.4 \\
+\(+\) multi-column range table & 18.5 & 30.2 \\
+\(+\) fused gadgets (\(F_O\)) & 22.1 & 41.2 \\
+\(+\) one fewer relation per softmax entry & 23.6 & 42.5 \\
+\(+\) rate-\(1/2\) code & 27.5 & 49.2 \\
+\(+\) small-value sumcheck and GKR & 37.4 & 66.1 \\
+\(+\) IOP challenges in \(\Fq\), two lookup instances (revision~4) & 50.3 & 87.9 \\
+\(+\) one lookup instance with grinding (profile~O, Mode~P) & \textbf{62.5} & \textbf{110.4} \\
+\(+\) recursive compression, charged & 59.8 & 105.7 \\
+\midrule
+Profile~O, Mode~C, no recursion & 66.2 & 116.7 \\
+Profile~O, 5:1 sliding window (hypothetical), no recursion & 104.4 & 124.5 \\
+\emph{Attestable, Gemma 4 31B \cite{attestable}} & \emph{53} & \emph{77} \\
+\bottomrule
+\end{tabular}
+\caption{Tokens per second, each row adding one change to the row above. All rows use revision~5's commitment parameters (cosets of \(4\), \(30\)-bit query grinding).}
+\label{tab:ladder}
+\end{table}
+
+Under proven bounds, profile~O exceeds both published figures (\(110\) against \(77\) tokens/s batched, \(62\) against \(53\) single-sequence), and still does with recursive compression charged (\(106\) and \(60\)), which yields a proof smaller than the published \(4\)--\(8\)\,MiB.
+What remains at \(16\)K is the attention matrix, about \(60\%\) of profile~O's work for the 8B model: every causal entry still costs one committed probability, one lookup and two constraint terms, and the probability must be committed because it is a lookup output.
+The remaining gap closes with fewer entries (sliding-window attention in most layers, which Gemma~2 and~3 use; Gemma~4's attention layout is not stated in the published figure); Mode~C no longer closes it.
+Commitment is now the largest cost (\(54\%\) of profile~O's work for the 8B model), and about half of it is hashing.
+Not modeled, and likely further gains: NTT encoding on tensor cores, faster GPU hashing than the \(120\)\,GB/s assumed (at \(300\)\,GB/s the 8B main proof would be about \(19\%\) cheaper, so a measured BLAKE3 kernel is the most valuable single measurement), and keeping the witness resident for short proofs instead of recomputing it in each phase.
+
+%======================================================================
+\section{Projected proving time}
+\label{sec:proj}
+
+Mode~P, central unit costs, one sequence with \(512\) generated tokens unless stated.
+Table~\ref{tab:proj} is the baseline profile; Table~\ref{tab:proj-o} is profile~O.
+These tables give the main proof; recursive compression adds \(4\)--\(6\%\) (Table~\ref{tab:rec}), and the serving bills of \S\ref{sec:serving} include it.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{Work (H100-s)} & \multicolumn{1}{c}{1\(\times\)H100} & \multicolumn{2}{c}{8\(\times\)RTX PRO 6000} & \(\$\)/M tok \\
+\cmidrule(lr){2-3}\cmidrule(lr){5-6}
+Model & \(4\)K & \(16\)K & \(16\)K & \(16\)K & \(4{\times}4\)K & \(16\)K \\
+\midrule
+Llama 3.1 8B & 32 & 207 & 3.4 min (79 t/s) & 43 s (380 t/s) & 617 t/s & 8.8 \\
+Qwen2.5-32B & 98 & 587 & 9.8 min (28 t/s) & 2.0 min (134 t/s) & 203 t/s & 25 \\
+Mixtral-8x7B & 47 & 260 & 4.3 min (63 t/s) & 54 s (302 t/s) & 435 t/s & 11.0 \\
+Llama 3.1 70B & 160 & 1{,}031 & \emph{memory}\(^\dagger\) & 3.6 min (76 t/s) & 124 t/s & 44 \\
+Llama 3.1 405B & 506 & 3{,}228 & \emph{memory} & 11 min (24 t/s) & 40 t/s & 137 \\
+GLM-5.3-Flash & 120 & 461 & \emph{memory} & 102 s (160 t/s) & 167 t/s & 19.5 \\
+\bottomrule
+\end{tabular}
+\caption{Proving time of the main proof, baseline profile. \(\$\)/M tok is per million proven tokens at \(\$2.50\) per H100-hour. Mode~C: multiply by about \(0.95\). Band: \([0.5\times, 2\times]\). The \(4{\times}4\)K column is a multi-tenant proof unless the four sequences belong to one client (\S\ref{sec:protocol}).
+\(^\dagger\)\(70.6\)\,GB of INT8 weights plus a \(16\)\,GB work unit and the KV cache exceed \(80\)\,GB; on two H100s the proof takes about \(10\) minutes.}
+\label{tab:proj}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{Work (H100-s)} & \multicolumn{1}{c}{1\(\times\)H100} & \multicolumn{2}{c}{8\(\times\)RTX PRO 6000} & \(\$\)/M tok \\
+\cmidrule(lr){2-3}\cmidrule(lr){5-6}
+Model & \(4\)K & \(16\)K & \(16\)K & \(16\)K & \(4{\times}4\)K & \(16\)K \\
+\midrule
+Llama 3.1 8B & 13 & 96 & 96 s (170 t/s) & 20 s (816 t/s) & 1{,}543 t/s & 4.1 \\
+Qwen2.5-32B & 38 & 262 & 4.4 min (62 t/s) & 55 s (300 t/s) & 530 t/s & 11.1 \\
+Mixtral-8x7B & 18 & 113 & 113 s (145 t/s) & 24 s (697 t/s) & 1{,}168 t/s & 4.8 \\
+Llama 3.1 70B & 67 & 486 & \emph{memory}\(^\dagger\) & 101 s (162 t/s) & 304 t/s & 21 \\
+Llama 3.1 405B & 224 & 1{,}566 & \emph{memory} & 5.4 min (50 t/s) & 93 t/s & 66 \\
+GLM-5.3-Flash & 63 & 223 & \emph{memory} & 50 s (330 t/s) & 346 t/s & 9.5 \\
+\bottomrule
+\end{tabular}
+\caption{Proving time of the main proof, profile~O (\S\ref{sec:opt}). Mode~C: multiply by about \(0.94\). Band: \([0.5\times, 2\times]\), with the two small-value factors the least certain.
+\(^\dagger\)On two H100s, about \(5\) minutes.}
+\label{tab:proj-o}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+& \multicolumn{4}{c}{Per-head ReLU indexer} & \multicolumn{2}{c}{No per-head non-linearity} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-7}
+& \multicolumn{2}{c}{Baseline} & \multicolumn{2}{c}{Profile O} & \multicolumn{2}{c}{Profile O} \\
+Context & Wall clock & tok/s & Wall clock & tok/s & Wall clock & tok/s \\
+\midrule
+\(4\)K & 27 s & 153 & 14 s & 292 & 14 s & 295 \\
+\(16\)K & 102 s & 160 & 50 s & 330 & 47 s & 346 \\
+\(64\)K & 7.6 min & 143 & 3.7 min & 298 & 3.0 min & 360 \\
+\(128\)K & 18 min & 124 & 8.6 min & 255 & 6.1 min & 361 \\
+\(256\)K & 45 min & 97 & 22 min & 196 & 12 min & 357 \\
+\(1\)M & 6.9 h & 42 & 3.6 h & 82 & 52 min & 333 \\
+\bottomrule
+\end{tabular}
+\caption{GLM-5.3-Flash on eight RTX PRO 6000, by context length. Beyond \(64\)K the indexer's per-(query, key, head) ReLU dominates; an indexer designed without it keeps the rate flat.}
+\label{tab:glm}
+\end{table}
+
+\paragraph{Shapes.}
+Dense rows use the published layer counts and widths.
+GLM-5.3-Flash uses the published fields listed in the bibliography. The expert width (\(2048\)), the KDA projection widths (\(64\times128\)) and form (\S\ref{sec:kda}), and the per-head ReLU in the indexer are assumptions.
+They move the GLM rows by about \(\pm 20\%\), except the ReLU assumption at long context (Table~\ref{tab:glm}).
+
+\subsection{Size of the main proof}
+\label{sec:size}
+
+Streaming makes the main proof grow with the number of work units.
+Each unit sends its own LogUp-GKR transcript per table and lookup instance (a tree of depth \(n\) has \(n(n+1)/2\) rounds), and each query opens one leaf (all of the unit's columns on a coset of \(4\) positions) and one Merkle path, down from the unit's cap, in every unit's subtree, because the unit subtrees are separate below the root.
+The fold oracles and the table side are shared and add a few MiB.
+The model takes a unit as \(16\)\,GB of resident witness and GKR layer (\(8\) bytes per committed element, one \(\Fq\) element per lookup leaf).
+Revision~2's estimate of \(10\)--\(30\)\,MiB counted these terms once per proof instead of once per unit.
+Revision~3 also undercounted the leaf width, which grows with the columns per unit; revision~5's smaller cosets, caps and fewer queries make the proof about \(3\times\) smaller than revision~4's.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{Baseline} & \multicolumn{3}{c}{Profile O} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-7}
+Model & Context & Units & Size & Units & Size & Verify \\
+\midrule
+Llama 3.1 8B & \(4\)K & 98 & 30 MiB & 50 & 21 MiB & 1.1 s \\
+Llama 3.1 8B & \(16\)K & 566 & 156 MiB & 364 & 121 MiB & 1.4 s \\
+Qwen2.5-32B & \(16\)K & 1{,}652 & 436 MiB & 989 & 316 MiB & 2.1 s \\
+Llama 3.1 405B & \(16\)K & 8{,}529 & 2.2 GiB & 5{,}599 & 1.7 GiB & 7.3 s \\
+GLM-5.3-Flash & \(16\)K & 1{,}487 & 366 MiB & 903 & 272 MiB & 2.0 s \\
+GLM-5.3-Flash & \(128\)K & 15{,}945 & 3.7 GiB & 9{,}950 & 2.8 GiB & 12 s \\
+GLM-5.3-Flash & \(1\)M & 385{,}558 & 88 GiB & 252{,}942 & 72 GiB & 4.6 min \\
+\bottomrule
+\end{tabular}
+\caption{Size and single-core verification time of the main (uncompressed) proof, Mode~P, central estimates (band \([0.5\times, 2\times]\)).}
+\label{tab:size}
+\end{table}
+
+These sizes are acceptable for an auditor that verifies a proof once and discards it, not for proofs sent to clients, kept per request, or posted publicly.
+Fewer, larger units help (units of \(64\)\,GB in host-pinned memory roughly quarter the size, at the cost of PCIe traffic in the sumcheck phase), but the deployable form is the compressed proof of \S\ref{sec:recursion}.
+
+%======================================================================
+\section{Recursive compression}
+\label{sec:recursion}
+
+\paragraph{Construction.}
+The compressed proof is a proof that the verifier of \S\ref{sec:protocol} accepts the main proof.
+It is built in layers, each a STARK over the same field with the same rules: Mode~P (IOP challenges in \(\Fq\), commitment in \(\Fo\), Johnson-radius query counts), BLAKE3 for Merkle trees and transcripts, rate \(1/2\).
+\begin{enumerate}
+\item \emph{Layer 1} executes the main verifier as an AIR: BLAKE3 compressions for the transcript, Merkle caps and paths, and the sampler PRF; \(\Fq\) arithmetic for the sumcheck and GKR round checks and the chunk sums; \(\Fo\) arithmetic for the fold checks; evaluation of the public polynomials; both grinding checks; and, if the weight opening was shared, the batch record.
+Its trace is split into segments of at most \(2^{30}\) cells.
+Every segment is an instance of one fixed segment circuit, which reads its position and its boundary values (transcript state, running claims) as public inputs.
+The first segment starts from the statement digest \(D\) below, the last one outputs \emph{accept}, and the next layer checks that consecutive boundary values are equal.
+\item \emph{Layer \(k+1\)} verifies all segment proofs of layer \(k\) in the same way, until a single segment remains. Each layer also has one fixed segment circuit.
+\item \emph{The final layer} uses rate \(1/16\), with \(44\) queries (about \(1.94\) bits each in the Johnson regime) and \(20\) bits of grinding, to keep the proof small. Its proximity term is about \(2^{-169}\).
+\end{enumerate}
+
+\paragraph{Fixed circuits.}
+The digest \(h_{\mathrm{rec}}\) of every outer circuit (the segment circuit of each layer, its preprocessed commitments, and the rule that maps a main-proof shape to a segment count) is part of the registry entry, next to \((C_W, h_{\mathrm{circ}})\), and is absorbed by every outer transcript.
+Each layer's circuit checks that the proofs it verifies were made for the circuit named in \(h_{\mathrm{rec}}\) for the layer below, and layer~1 checks that the main proof was made for \(h_{\mathrm{circ}}\).
+Without this, the verifier would accept a final proof for whatever outer circuit the server described, including one that accepts any main proof.
+Because the segment circuit is the same at every position, the number of segments can depend on the request without changing \(h_{\mathrm{rec}}\).
+
+\paragraph{Public input and privacy.}
+The public input of the compressed proof is the statement digest
+\[
+D = \mathsf{H}(\mathsf{mode} \| \mathsf{policy} \| C_W \| h_{\mathrm{circ}} \| h_{\mathrm{rec}} \| \mathsf{H}(s_x \| x) \| \mathsf{H}(s_x \| y) \| n_c \| S),
+\]
+where \(s_x\) is a \(256\)-bit statement salt that the client chooses, sends with the request, and keeps with the receipt; a third party links a published proof to a request only if the client discloses \(s_x\).
+\(x\), \(y\), \(s_x\) and the transcript salt are witnesses of layer 1.
+Layer 1 checks the two salted digests, the termination rule, and the server-prefix digest, and evaluates the one-hots from \(x\) and \(y\).
+Every outer layer is zero-knowledge: leaves are salted, and each trace is padded with random rows so that the openings of a query reveal nothing about the witness.
+This is standard for AIR-based STARKs, unlike the multilinear ZK mode of \S\ref{sec:zk}, and the model charges it at \(2\%\) of the outer work.
+A published compressed proof therefore reveals neither the transcript salt nor anything about \(x\) and \(y\) beyond their salted digests, so a short prompt cannot be recovered by guessing.
+The main proof is still not zero-knowledge and stays with the request's own verifier.
+The client still checks the registry entry, the receipt and the decomposition of its own prompt (step 1 of \(\mathsf{Verify}\)).
+The hash stays BLAKE3 throughout, so the compressed proof adds no hash assumption.
+A recursion-friendly hash such as Poseidon2 would make the outer layers about \(5\times\) cheaper, but it would add a younger algebraic hash to the security argument.
+
+\paragraph{Security.}
+Each layer is a Fiat--Shamir STARK with the budget of Table~\ref{tab:budget}.
+The errors of the main proof and of the outer layers add, so a compressed proof with four outer layers and every term at \(2^{-100}\) would reach only about \(97.7\) bits.
+Every layer therefore runs its tight terms (queries, and the main proof's lookup term) at \(103\) bits; five terms of \(2^{-103}\) sum to below \(2^{-100.6}\).
+The cost is \(7\) more queries in the main proof and \(2\) in the final layer.
+Soundness of the compressed proof follows from knowledge soundness of each layer: an extractor for layer \(k+1\) yields accepting layer-\(k\) proofs, down to an accepting main proof, which by the theorem of \S\ref{sec:security} implies \(y = F(W, x, r)\).
+This composition evaluates BLAKE3 inside the circuit, so it is proved by treating BLAKE3 as the random oracle outside the circuit and as a concrete function inside it.
+That is the standard heuristic of every deployed recursive STARK; it is an assumption in addition to the random-oracle model of the main proof.
+The depth is at most \(4\) outer layers in Table~\ref{tab:rec}, which keeps the extraction loss bounded.
+A party that does not accept the heuristic verifies the main proof instead.
+The server can regenerate the main proof at any time, because \(F\) is deterministic and the trace depends only on \((x, y, n_c)\); a regenerated proof uses a fresh transcript salt.
+
+\paragraph{Cost.}
+The outer work is dominated by the BLAKE3 compressions the main verifier performs: one leaf and one path below the cap per unit per query, one cap per unit, and one transcript absorption per GKR round.
+With cosets of \(16\) (revision~4) a leaf took \(71\) compressions against \(20\) for its path in the 8B model, so leaf width set the cost; cosets of \(4\) cut it to \(18\).
+The model charges \(4096\) trace cells per compression (band \(2{,}000\)--\(12{,}000\), since BLAKE3's \(32\)-bit additions and rotations need byte decompositions in an AIR), \(16\) cells per extension-field operation, and \(4\times 10^{-10}\) H100-seconds per cell.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Model (profile O) & Context & Main proof (H100-s) & Outer (H100-s) & Share & Layers \\
+\midrule
+Llama 3.1 8B & \(4\)K & 13 & 0.8 & \(5.8\%\) & 2 \\
+Llama 3.1 8B & \(16\)K & 96 & 4.4 & \(4.6\%\) & 2 \\
+Qwen2.5-32B & \(16\)K & 262 & 12 & \(4.5\%\) & 3 \\
+Llama 3.1 405B & \(16\)K & 1{,}566 & 65 & \(4.2\%\) & 3 \\
+GLM-5.3-Flash & \(16\)K & 223 & 10.2 & \(4.6\%\) & 3 \\
+GLM-5.3-Flash & \(128\)K & 2{,}314 & 110 & \(4.7\%\) & 3 \\
+GLM-5.3-Flash & \(1\)M & 57{,}568 & 2{,}786 & \(4.8\%\) & 4 \\
+\bottomrule
+\end{tabular}
+\caption{Cost of recursive compression, Mode~P, including zero-knowledge outer layers. With the cell-count band, the share ranges from about \(2\%\) to \(18\%\).}
+\label{tab:rec}
+\end{table}
+
+The result is a proof of about \(400\)\,KiB that verifies in about \(50\)\,ms, whatever the model or context.
+That is smaller than the \(4.4\)--\(7.9\)\,MiB Attestable reports.
+These two figures are estimates for a final layer at rate \(1/16\); they depend on its trace width, which is not yet fixed.
+Recursion adds latency after the main proof, roughly \(5\%\) of its wall-clock time, because layer-1 segments are proved in parallel and the later layers are small; with a shared weight opening it also waits for the batch to close.
+The outer prover needs no more memory than a \(2^{30}\)-cell segment and its codeword, about \(16\)\,GB.
+
+%======================================================================
+\section{Multi-turn sessions}
+\label{sec:session}
+
+A proof per turn from position \(0\) proves a session's early positions up to \(T\) times, for a session of \(T\) turns (a conversation, or the steps of an agent): the proved positions grow with \(T^2\) and the attention entries with \(T^3\).
+Two ways avoid this.
+A \emph{whole-session proof} (\S\ref{sec:whole}) proves all turns at once in one default-mode proof, with the default mode's security; it is the default for multi-turn work.
+\emph{Session mode} (\S\ref{sec:incr}) proves each turn when it ends, against commitments to the earlier turns' state; it is for clients that must rely on a turn before the session ends, and it rests on more machinery.
+
+\subsection{Whole-session proof (default)}
+\label{sec:whole}
+
+The session's statement is that of \S\ref{sec:incr} below: turns \(k = 1, \ldots, T\), context \(X_k = X_{k-1} \| x_k \| y_k\), per-turn nonces \(n_{c,k}\), seeds \(r_k\), receipts and the context digests \(\chi_k\).
+One proof evaluates \(F\) teacher-forced over all \(P_T\) positions of \(X_T\) and applies the sampling relation of \S\ref{sec:sampling} at every generated position of every turn, with that turn's seed, and the termination rule to every \(y_k\).
+The positions of each \(y_k\) are public, and so is the mask that selects them.
+Because \(F\) is causal and its boundaries are absolute, the logits at turn \(k\)'s positions are those that a proof of turn \(k\) alone would compute, so the proof establishes every turn's relation.
+It is a default-mode proof in every other respect: \(103\)-bit parameters, one trace, no state trees, no link chain, no cross-proof argument.
+The client checks the decomposition of every \(x_k\) (\S\ref{sec:statement}) and the chain of \(\chi_k\).
+
+It costs about one proof of \(X_T\), less than session mode, because it pays the per-proof fixed costs once (Table~\ref{tab:session}).
+Its limit is latency: until it exists, each turn is covered only by its signed receipt.
+It can be produced when the session ends, on dispute or audit, or at checkpoints: proofs after turns \(1, 2, 4, 8, \ldots\) cover every turn within twice its index, at \(1.5\)--\(1.9\times\) the cost of one whole-session proof.
+It needs no state on the server between turns if the client resends its history, as stateless chat APIs already require.
+It is also the backstop for session mode: a whole-session proof of a session also proved in session mode does not depend on any of session mode's mechanisms.
+
+\subsection{Session mode: incremental proofs (optional)}
+\label{sec:incr}
+
+Session mode proves each position once and each turn when it ends.
+Turn \(k\) proves only its new positions and reads the state of earlier positions from commitments made by the proofs that computed them.
+The relation each turn proves is unchanged.
+
+\paragraph{Statement.}
+A session has turns \(k = 1, \ldots, T \le T_{\max} = 2^{10}\) and belongs to one client.
+Its context is \(X_k = X_{k-1} \| x_k \| y_k\), with \(X_0\) empty or a public prefix (below), and \(P_k = |X_k|\).
+Turn \(k\) proves \(y_k = F(W, X_{k-1} \| x_k, r_k)\), the relation of \S\ref{sec:statement} for the request \((X_{k-1} \| x_k, y_k)\), with the termination rule applied to \(y_k\).
+Its public input adds the offset \(P_{k-1}\), the context digest \(\chi_{k-1}\) and the link digest \(\lambda_{k-1}\) (below), and it outputs \(\chi_k = \mathsf{H}(s \| \chi_{k-1} \| x_k \| y_k)\) and \(\lambda_k\), where \(s\) is a per-session salt known to the client.
+In the seed, the receipt and the transcript, \(\mathsf{H}(x)\) is replaced by \((\chi_{k-1}, \mathsf{H}(x_k))\), and \(n_c\) by the turn's nonce \(n_{c,k}\).
+A full proof of turn \(k\) from position \(0\), at the session-mode parameters below, uses the same values, so the two forms prove the same statement and a verifier accepts either.
+
+The session header \(\eta = (C_W, h_{\mathrm{circ}}, h_{\mathrm{rec}}, \mathsf{policy})\) is fixed for the whole session and is the base of the link chain: \(\lambda_0 = \mathsf{H}(s \| \eta \| \lambda_{\mathrm{pre}})\), with \(\lambda_{\mathrm{pre}}\) the public prefix's link (below) or empty.
+Each turn's inner verifier checks that its own \((C_W, h_{\mathrm{circ}}, h_{\mathrm{rec}}, \mathsf{policy})\) equals the \(\eta\) in the chain.
+Without this check a server could change the weights between turns. Every turn would verify, but turn \(k\) would apply new weights to state computed with the old ones, a function that is \(F\) under no single \(W\); revision~8 omitted it.
+
+\paragraph{Carried state.}
+Besides its trace, turn \(k\) commits a \emph{state tree} with the columns that later turns read, for its own positions \([P_{k-1}, P_k)\):
+\begin{itemize}
+\item dense attention: \(\hat K\) after RoPE and \(\hat V\), every layer;
+\item sparse layers, per position: the latent key and value (\(512\)), the RoPE key (\(64\)), and the \(8\)-bit indexer key \(\hat k_t\) (\(128\)); pooled keys are exact sums of these and are not stored;
+\item KDA layers: \(H\) and \(\hat H\) with its exponents \(f_j\) at the last chunk end at or before \(P_k\); \(\hat k\), \(\hat v\) and \(\lambda\) of every position of the chunk that is open at \(P_k\) (at most \(127\)); and the convolution inputs \(\hat x\) of \(q\), \(k\) and \(v\) at the last \(3\) positions. At most \(2^{22.4}\) elements per layer.
+\end{itemize}
+Every boundary that \(F\) uses (the \(128\times128\) tiles, the \(PV\) blocks, the pools of \(4\), the KDA chunks of \(128\) and sub-chunks of \(8\)) is at an absolute position, so splitting the context at \(P_{k-1}\) does not change \(F\): a turn that starts inside a tile masks the earlier rows by \(\nu\), and the turn that completes a KDA chunk proves its state.
+This list is a soundness requirement (Lemma~\ref{lem:suff}).
+A value that a later turn reads but that no state tree holds has no proof.
+A later turn may recompute a value only if \(F\) defines it as a function of values the trees hold: for KDA, the open chunk's \(\Lambda\), \(\tilde k\), \(G\) and \(k^{\mathrm{end}}\), which depend on decays of positions not yet seen when the earlier turn ended.
+Revisions~8--10 listed pooled keys instead of the per-token keys they are summed from, and omitted the convolution history and the open chunk's decays; without them a later turn could not prove its first three positions' convolutions or its first chunk's scores.
+
+\begin{lemma}[State sufficiency]
+\label{lem:suff}
+For every architecture of \S\ref{sec:F} and every split point \(P\), the values of \(F\) at positions \(\ge P\) depend on positions \(< P\) only through the list above, evaluated on \(X_{<P}\), and every value a later turn derives from that list equals the value \(F\) defines.
+\end{lemma}
+\noindent\emph{Proof sketch.}
+Every operation of \S\ref{sec:F} except attention, the sparse indexer and gather, KDA and the short convolutions acts on one position.
+Full attention at row \(m \ge P\) reads \(\hat K_j, \hat V_j\) for \(j \le m\); its maximum, probabilities, blocks and division are per row.
+The indexer reads \(\bar k_j\), a sum of listed \(\hat k_t\); top-\(k\), slots and the gather read listed latents and RoPE keys.
+A convolution at \(t \ge P\) reads \(\hat x_{t-3..t}\).
+KDA at \(t \ge P\) in a chunk starting at \(c_0\) reads \(H\) and \(\hat H\) at \(c_0\), and \(\hat k_s, \hat v_s, \lambda_s\) for \(s \in [c_0, t]\). From these \(F\) defines \(\Lambda\), \(\tilde k\), \(G\), \(A\) and \(k^{\mathrm{end}}\), and at the chunk end \(H'\) from \(H\).
+If \(c_0 < P\), \(c_0\) is the last chunk end at or before \(P\).
+Because the boundaries are absolute, the definitions do not depend on \(P\). \(\square\)
+The state columns are the same polynomials that the turn's own constraints use.
+They sit in a separate tree because a later opening of the trace tree would need the full leaf of every unit.
+The state tree has salted leaves, uses the trace's code, and is committed with the trace root in phase~1, before any challenge.
+
+\paragraph{Binding to one polynomial.}
+Later turns must read exactly the polynomial that turn \(k\) committed.
+The trace is tested in the Johnson regime, where a Merkle root can be close to several codewords, and a later proof that opens such a root need not be bound to the codeword the first proof used.
+State trees are therefore tested in the \emph{unique-decoding regime}.
+Each turn runs one proximity test in that regime, separate from the trace batch. It covers a random linear combination of the turn's new state tree, any tree it merges into, and every tree it opens: rate \(1/2\), relative distance below \(1/4\), \(208\) queries at \(0.415\) bits each with \(30\) bits of grinding, \(2^{-116.3}\).
+Correlated agreement in the unique-decoding regime holds for random combinations with an error of the order of the code length over \(|\Fo|\), so if any tree in the batch is far from the code, the combination is too.
+Each tree is therefore tested when it is committed and whenever it is opened, for one test term per turn.
+A root then determines at most one codeword within that distance, so the polynomial behind each root is unique, and the composition is the standard one: turn \(k\)'s proof shows that this polynomial is \(F\)'s state, and every later opening is a claim about the same polynomial.
+The tests add about \(0.1\%\) to a session.
+
+As a second binding, turn \(k\) draws an out-of-domain point \(z_k\) in \(\Fo\) after the state root, sends the evaluations \(v_{k,i}\) of every state column at \(z_k\), and proves them in its own opening, batched with its constraint claims on the state columns.
+Every later turn that opens the tree proves the same evaluations.
+It outputs \(\lambda_k = \mathsf{H}(s \| \lambda_{k-1} \| k \| \mathrm{root}_k \| z_k \| (v_{k,i})_i \| \text{live trees})\); verifiers reject turns with \(k > T_{\max}\).
+Revision~9 relied on the out-of-domain evaluation alone, a cross-proof argument for the list-decoding regime that is not in the literature.
+
+\paragraph{Proving and verifying a turn.}
+The prover evaluates \(F\) on the new positions from its cache of the session's state (or recomputes it from \(X_{k-1}\)), commits the trace and the state tree, and runs \(\mathsf{Prove}\) (\S\ref{sec:protocol}).
+The attention, gather and KDA sumchecks of the new rows run over absolute key indices and end in claims \(\tilde K(r)\) on the state of all earlier positions, which is spread over several trees at offsets that are in general not powers of two.
+A \emph{re-indexing sumcheck} per earlier tree \(j\), over its local index \(i\), splits such a claim:
+\[
+\textstyle \tilde K(r) = \sum_j \sum_{i < n_j} \mathrm{eq}(r, i + o_j)\, K_j[i],
+\]
+where \(o_j\) and \(n_j\) are the public offset and length of tree \(j\).
+The multilinear extension of \(i \mapsto \mathrm{eq}(r, i + o_j)\) is evaluable by the verifier in \(O(\log S)\) by tracking carries bit by bit, and the summand has degree \(2\).
+The same sumcheck handles a tile that straddles a turn boundary.
+Each tree's claims are then reduced to one point, like weight claims, and opened against it together with the evaluations at its \(z_j\).
+Revision~8 stated the reduction without this step.
+
+\emph{Merging.} Opening every earlier tree costs each turn a proximity test and a set of Merkle paths per tree, so recursion grows with \(k\); for \(1{,}024\) turns of \(256\) tokens the openings would cost a third of the session.
+The session's trees are therefore merged like a binary counter. When a turn leaves two trees covering the same number of turns, it merges them: it commits the concatenated state as one new tree, included in the turn's unique-decoding test and with its own out-of-domain binding, and proves at one random point that the new polynomial equals the re-indexed old ones.
+A turn then opens at most \(\lfloor\log_2 k\rfloor + 1\) session trees, plus the prefix tree, which is shared across sessions and never merged, and each state element is re-committed at most \(\log_2 T\) times.
+Merging saves \(7\)--\(33\%\) for sessions of \(64\) to \(1{,}024\) short turns and keeps an uncompressed turn proof from growing by about \(130\)\,KB per earlier turn.
+The prover keeps the earlier state codewords or re-encodes them; the model charges \(c_{\mathrm{commit}} + c_{\mathrm{wred}} + c_{\mathrm{wopen}}\) per earlier state element, about \(1\)\,MiB of codeword per position for the 8B model at rate \(1/4\) if kept.
+The inner verifier receives \(\eta\) and the live trees' \((\mathrm{root}_j, o_j, n_j, z_j, (v_{j,i}))\), and checks that they hash to \(\lambda_{k-1}\).
+By default the session's verifier checks each turn's compressed proof (about \(50\)\,ms; about \(436\)\,KiB at the \(48\) final-layer queries of session mode) and that each turn's inputs \((P_{k-1}, \chi_{k-1}, \lambda_{k-1})\) are the previous turn's outputs.
+If the session starts from a public prefix, the client also verifies the prefix proof once, or relies on the registry for it.
+Optionally one aggregation layer proves the verification of all \(T\) compressed proofs.
+Turns do not verify their predecessors recursively: the argument of \S\ref{sec:recursion} covers a fixed number of layers, not a depth that grows with \(T\).
+So, unlike the default mode, a verifier that checks only turn \(k\)'s proof learns nothing: turn \(k\) is only as good as the chain under it.
+Client software therefore keeps the last \(\lambda\) it verified and extends it turn by turn, and a third-party auditor needs every turn's proof or the aggregation proof.
+
+In a compressed proof the public input \(D\) gains \(P_{k-1}\) and freshly salted commitments \(\mathsf{H}(t_k \| \chi_{k-1} \| \lambda_{k-1})\) and \(\mathsf{H}(t'_k \| \chi_k \| \lambda_k)\), with \(t_k, t'_k\) given to the client, which checks the chain.
+A third party who sees two turns' compressed proofs cannot link them; revision~9 put \(\lambda\) itself into \(D\), which made consecutive turns linkable.
+The offset reveals the length of the conversation so far, as \(S\) does in the default mode.
+An uncompressed turn proof reveals evaluations of the state to its verifier, as it already does for the trace.
+
+\emph{Stateless variant.} The server need not keep anything between turns: the client resends \(X_{k-1}\) and a session secret \(\sigma\), from which the salts are derived. The server recomputes the earlier state by a forward pass of \(F\) and re-encodes the live trees, which reproduces their roots. This costs at most \(12\)--\(18\%\) of a session, charging the forward pass at the four-pass witness rate (about \(4\%\) for a single pass), and restores the property of proof on demand that the server keeps nothing per request.
+
+\paragraph{Security.}
+If some turn has \(y_k \ne F(W, X_{k-1} \| x_k, r_k)\), the session is accepted only if that turn's proof, or one of the outer proofs it rests on, accepts a false statement.
+Session mode budgets this as a union over the turns' proofs, which is conservative under the round-by-round argument, where the adversary's oracle queries are counted once.
+It raises the tight terms from \(103\) to \(113\) bits:
+\begin{itemize}
+\item \(21\)-bit LogUp grinding, giving \(2^{-113.9}\) per chunk;
+\item \(174\) queries at rate \(1/2\) (\(86\) at rate \(1/4\)), with the same \(30\)-bit grinding;
+\item \(48\) queries in the final layer.
+\end{itemize}
+With at most \(T_{\max} = 2^{10}\) turns (a prefix counts as one), \(6\) outer layers each, one optional aggregation layer and one unique-decoding test per turn, the session error is at most \((7T + 1)\cdot 2^{-113} + T\cdot 2^{-116.3} \le 2^{-100.1}\) (Theorem~\ref{thm:session}).
+The other terms of Table~\ref{tab:budget} are already below \(2^{-116}\).
+The extra queries add about \(13\%\) to recursion, under \(1\%\) of a turn.
+
+\emph{Weights across proofs.} Every proof opens \(C_W\) in the Johnson regime. For open weights this is enough, because anyone recomputes \(C_W\) from the checkpoint, so it is an exact codeword.
+For closed weights it is not: two proofs, or two turns, could be bound to different codewords near the same root.
+That would break the default mode's claim that every proven request used one committed model, and in session mode it would mix weights inside one function.
+The registry entry of a closed-weight \(C_W\) therefore carries one unique-decoding proximity proof of \(C_W\), made once per release at the weights' rate with the query count for \(2^{-116}\), and verified when the entry is pinned.
+
+\begin{theorem}[Session soundness]
+\label{thm:session}
+Model BLAKE3 as a random oracle and charge the adversary per oracle call, as in Table~\ref{tab:budget}; let it make \(Q\) calls.
+Suppose a verifier accepts turns \(1, \ldots, k \le T_{\max}\) of a chain that starts at \(\lambda_0 = \mathsf{H}(s \| \eta \| \lambda_{\mathrm{pre}})\), each turn by its compressed proof or by a full proof at the session parameters, with every turn's inputs equal to the previous turn's outputs.
+Then, except with probability
+\begin{align*}
+\varepsilon &\;\le\; \sum_{j \le k} \Big(\varepsilon_{\mathrm{in}} + \sum_{\ell \le 6} \varepsilon_{\mathrm{out},\ell} + \varepsilon_{\mathrm{udr}}\Big) + \varepsilon_{\mathrm{agg}} + \varepsilon_{\mathrm{merge}} + \varepsilon_{W} + \frac{Q^2}{2^{256}}\\
+&\;\le\; (7k+1)\,2^{-113} + k\,2^{-116.3} + 2^{-116} + 2^{-109.4} + \frac{Q^2}{2^{256}},
+\end{align*}
+there is one \(W\), the decoding of \(C_W\) in \(\eta\), such that \(y_j = F(W, X_{j-1} \| x_j, r_j)\) for every \(j \le k\).
+Here \(X_j = X_{j-1} \| x_j \| y_j\), \(X_0\) is the prefix behind \(\lambda_{\mathrm{pre}}\) (or empty), \((x_j, y_j)\) are the values bound in \(\chi_j\), and \(r_j\) is turn \(j\)'s seed.
+\end{theorem}
+
+\noindent\emph{Proof.}
+\emph{(1) Hashes.} Outside the collision term, the adversary's oracle calls contain no collision.
+Every Merkle root that it later opens consistently was computed from leaves in its call list, so the leaves can be extracted straight-line, as in the BCS transform.
+Each accepted \(\lambda_j\) therefore determines \((s, \lambda_{j-1}, j, \mathrm{root}_j, z_j, (v_{j,i}), \text{live trees})\), and by induction \(\lambda_0\), \(\eta\) and \(\lambda_{\mathrm{pre}}\).
+All turns thus share one \(C_W\), \(h_{\mathrm{circ}}\), \(h_{\mathrm{rec}}\) and policy, the turn index is the chain position, and every tree a turn opens is a tree that an earlier turn of the same chain committed.
+Each \(\chi_j\) determines \((x_i, y_i)_{i \le j}\), and each root determines an extracted word \(w\).
+
+\emph{(2) Decoding.} The registry's test of \(C_W\) (or its public recomputation) gives one codeword, hence one \(W\), outside \(\varepsilon_W \le 2^{-116}\).
+Let \(K\) be the polynomial of the unique codeword within relative distance \(1/4\) of a state word \(w\), if there is one.
+Each turn's batched test covers every state word it commits, merges or opens.
+If one of them has no such codeword, the random combination is also far, up to the correlated-agreement error, and the test passes with probability at most \(2^{-116.3}\).
+Outside \(\sum_j \varepsilon_{\mathrm{udr}}\), every state tree of the chain therefore decodes to a unique \(K\).
+In the unique-decoding regime, an accepted evaluation proof against the root then establishes the claimed value of that \(K\), and the out-of-domain answers \(v_{j,i}\) are values of the same \(K\) in every turn that proves them.
+
+\emph{(3) One turn.} Extract turn \(j\)'s inner proof from its compressed proof one layer at a time.
+Each of the at most \(6\) outer layers proves that the verifier of the layer below accepted, for the circuit named in \(h_{\mathrm{rec}}\).
+Its knowledge error is \(\varepsilon_{\mathrm{out},\ell}\), and its extractor is straight-line in the random-oracle model.
+Because turns do not verify each other, the depth is constant, and each turn is extracted separately, so the extraction does not compound over \(T\).
+The optional aggregation layer adds one more term, \(\varepsilon_{\mathrm{agg}}\).
+Relative to \(W\) and the decoded \(K\)'s of the trees it opens, the inner proof is a single default-mode argument with session parameters for the relation ``the trace satisfies \(F\)'s constraints on \([P_{j-1}, P_j)\), with reads of earlier state equal to the decoded polynomials through the re-indexing sumcheck, and its own state tree decodes to the state columns its constraints use.''
+Outside \(\varepsilon_{\mathrm{in}}\), the relation holds.
+By Lemma~\ref{lem:nowrap} and Lemma~\ref{lem:det}, every constrained value is the one \(F\) defines from those inputs.
+
+\emph{(4) Induction over turns.} Hypothesis \(\mathcal{H}_j\): every live tree after turn \(j\) decodes to the listed state of the true context \(X_j\) over its range of positions.
+\(\mathcal{H}_0\) holds: with no prefix there are no trees, and a prefix tree is the output of the prefix proof, a turn~\(0\) to which step~(3) applies with no earlier state.
+Assume \(\mathcal{H}_{j-1}\).
+Step~(3) gives turn \(j\)'s outputs as \(F\) evaluated on the correct earlier state.
+By Lemma~\ref{lem:suff} this is \(F(W, X_{j-1} \| x_j, r_j)\), and its new tree holds the state of \(X_j\) on \([P_{j-1}, P_j)\).
+A merge commits a tree \(M\) and proves \(\tilde K_M(\rho) = \sum_i \sum_{u} \mathrm{eq}(\rho, u + o_i)\, K_i[u]\) at a point \(\rho\) drawn after \(\mathrm{root}_M\).
+Both sides are multilinear in at most \(25\) variables, so by Schwartz--Zippel they are equal as polynomials except with probability \(25/|\Fq|\) per merge, at most \(2^{-109.4}\) over the at most \(T_{\max}\) merges of a session (\(\varepsilon_{\mathrm{merge}}\)).
+The sumchecks that reduce both sides to tree openings are part of the merging turn's \(\varepsilon_{\mathrm{in}}\).
+\(M\) then holds the concatenation, and \(\mathcal{H}_j\) follows.
+
+\emph{(5) Total.} Summing the per-turn terms at the session parameters (\(113\) bits for the inner and outer terms, \(116.3\) for the test) gives the bound. Without the collision term it is at most \(2^{-100.1}\) for \(k \le 2^{10}\); the collision term is below \(Q \cdot 2^{-128}\) for \(Q \le 2^{128}\). \(\square\)
+
+\noindent The theorem gives no guarantee for a turn whose chain is not verified back to \(\lambda_0\); this is the dependency stated under \emph{Proving and verifying a turn}.
+It uses no property of the out-of-domain binding: that binding is defense in depth.
+The stateless variant and full proofs substituted for turns prove the same relation and are covered.
+
+Soundness-critical requirements, in addition to those of the default mode:
+\begin{itemize}
+\item one header \(\eta\) for the whole session, checked by every turn;
+\item for closed weights, the registry's unique-decoding test of \(C_W\);
+\item a complete state list with absolute boundaries (Lemma~\ref{lem:suff});
+\item the state tree committed in phase~1;
+\item one batched unique-decoding proximity test per turn, covering every state tree the turn commits, merges or opens;
+\item out-of-domain binding for every state tree, with the answers proved by the turn that commits the tree and by every turn that opens it (defense in depth; Theorem~\ref{thm:session} does not use it);
+\item the turn index in \(\lambda\), and \(k \le T_{\max}\);
+\item a verified chain from \(\lambda_0\) to the turn relied on;
+\item claims on earlier state split across trees by the re-indexing sumcheck;
+\item full proofs substituted for turns at the session-mode parameters;
+\item inputs of each turn equal to the outputs of the previous one;
+\item the public offset \(P_{k-1}\) used for positions, RoPE and masks;
+\item a fresh nonce per turn.
+\end{itemize}
+
+\paragraph{Public prefix.}
+A server prefix with digest \(h_{\mathrm{pre}}\) can be turn~\(0\): it is proved once, with no generated tokens, and \(\lambda_{\mathrm{pre}} = \mathsf{H}(C_W \| h_{\mathrm{circ}} \| h_{\mathrm{rec}} \| h_{\mathrm{pre}} \| \mathrm{root}_0 \| z_0 \| (v_{0,i}))\) is published unsalted with the registry entry, since it is a function of public data.
+Every session that uses the prefix starts at \(P_0 = |\text{prefix}|\), and its turns check that the model in \(\lambda_{\mathrm{pre}}\) is the model in \(\eta\).
+Anyone who relies on the prefix verifies its proof once.
+The server stores the prefix's state codeword for each \(C_W\) it serves.
+
+\paragraph{Serving.}
+\begin{itemize}
+\item Per open session the server keeps the KV and state cache it already keeps for serving, the state codewords or the means to recompute them, and salts derived from a per-session key, unless it uses the stateless variant.
+\item Session mode pays only when every turn is proved as it ends. For audit, dispute or end-of-session attestation, a whole-session proof (\S\ref{sec:whole}) is cheaper and has the default mode's security.
+\item Session mode adds soundness-critical mechanisms that the default mode does not have: the state list, absolute boundaries, re-indexing, merging and the link chain. A deployment that uses it should also produce a whole-session proof at the end of each session, or of a random sample of sessions, which does not depend on them. Proving both costs about twice session mode, still about \(3\times\) less than proving every turn from position \(0\) for \(16\) turns.
+\item A client who edits an earlier message starts a new session.
+\item Each turn still pays the per-proof fixed costs, mostly the pass over the weights (about \(13\) H100-seconds for GLM-5.3-Flash). Session turns therefore join the shared weight opening (\S\ref{sec:weights}) by default, which leaves each turn the claim reduction (about \(6.4\) H100-seconds for GLM-5.3-Flash) and makes GLM-5.3-Flash sessions \(14\)--\(15\%\) cheaper. The reduction is the remaining gap between a GLM-5.3-Flash session and one proof of its final context; sharing it is open (\S\ref{sec:weights}).
+\end{itemize}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& & Each turn & Whole-session & & Session & Session mode, \\
+Model (profile O) & Turns & from \(0\) & proof & Checkpoints & mode & last turn \\
+\midrule
+Llama 3.1 8B & 4 (\(8\)K) & 79 & 35 & 55 & 38 & 13 \\
+Llama 3.1 8B & 8 (\(16\)K) & 373 & 101 & 156 & 109 & 21 \\
+Llama 3.1 8B & 16 (\(32\)K) & 2{,}109 & 327 & 483 & 346 & 38 \\
+Qwen2.5-32B & 8 (\(16\)K) & 1{,}028 & 274 & 429 & 288 & 54 \\
+Qwen2.5-32B & 16 (\(32\)K) & 5{,}640 & 859 & 1{,}288 & 895 & 95 \\
+GLM-5.3-Flash & 8 (\(16\)K) & 1{,}033 & 228 & 436 & 282 & 37 \\
+GLM-5.3-Flash & 16 (\(32\)K) & 3{,}937 & 473 & 908 & 588 & 40 \\
+\bottomrule
+\end{tabular}
+\caption{H100-seconds for a session of turns of \(2\)K positions (\(512\) generated), Mode~P, recursion included. Checkpoints are whole-session proofs after turns \(1, 2, 4, \ldots\) and the last. Session mode is at its \(113\)-bit parameters, with tree merging and unique-decoding state trees; the stateless variant adds \(12\)--\(18\%\). Every proof is in a shared weight opening of \(16\).}
+\label{tab:session}
+\end{table}
+
+For a request of \(1{,}024\) prompt and \(512\) generated tokens after a public prefix of \(2\)K / \(4\)K / \(8\)K tokens, a committed prefix makes the proof \(1.9\) / \(2.6\) / \(4.1\times\) cheaper for the 8B model (\(21\) to \(8\) H100-seconds at \(4\)K), \(1.9\) / \(2.7\) / \(4.3\times\) for Qwen2.5-32B, and \(1.8\) / \(2.5\) / \(4.1\times\) for GLM-5.3-Flash.
+
+%======================================================================
+\section{Serving cost}
+\label{sec:serving}
+
+\paragraph{What the server runs.}
+The server must serve \(F\): INT8 GEMMs with per-row dynamic activation exponents, static INT8 \(Q,K,V\), integer softmax by table, and the sampler of \S\ref{sec:sampling}.
+Its arithmetic matches INT8 W8A8 serving plus elementwise gadget work, and integer arithmetic makes it batch-invariant: chunked prefill, paged KV caches, prefix caching, and speculative decoding (verifying draft tokens against the inverse-CDF sample with the same \(u_t\)) all give bit-identical results.
+No production kernel for \(F\) exists, and several parts of \(F\) do not map onto existing fast kernels:
+\begin{itemize}
+\item \emph{Exact row maximum.} FlashAttention's running maximum rescales partial sums by \(\exp(M_{\mathrm{old}} - M_{\mathrm{new}})\), which is not exact in integers. Kernels for \(F\) need a separate pass for \(M_m\), adding about one \(QK^\top\) computation (up to \(1.5\times\) attention FLOPs in prefill, and a second pass over the KV cache in decode).
+\item \emph{Exponential by table.} A gather from a \(2^{22}\)-entry table per score does not fit in shared memory. \(\tau_{\exp}\) should therefore be defined so a kernel can compute it exactly: a \(2^{10}\)-entry table of the fractional part, shifted by the integer part. The proof is unchanged, since it looks up the full table whatever generated its rows.
+\item \emph{Fixed rounding points.} \(PV\) partial sums are rounded at fixed \(4096\)-key block boundaries in absolute positions, whatever the kernel's tiling, by a shift that depends on the row's \(D_m\). Kernels keep the unrounded block partials (below \(2^{29}\), so INT32) until \(D_m\) is known, then round and add them.
+\item \emph{Accumulator exactness.} INT8 tensor cores accumulate exactly in INT32. Profile~O's \(9\)-bit RoPE outputs need FP16 inputs, which are exact only if the hardware accumulates in true FP32 and all partial sums stay below \(2^{24}\) (here \(< 2^{22}\)); this must be tested per GPU generation. FP8 paths are not usable, since some accumulate with reduced precision. INT8 tensor throughput is not guaranteed to keep pace with FP8 on future datacenter parts.
+\item \emph{Tensor parallelism.} Shards must all-reduce INT32 accumulators before rounding, twice the traffic of a BF16 all-reduce.
+\end{itemize}
+Serving rates below are those of published INT8/FP8 serving; with the overheads above, attention-heavy requests may serve \(1.2\)--\(1.5\times\) slower, which lowers the bill but raises cost per request.
+
+\paragraph{Rates.}
+GLM-5.3-Flash on the eight-card node: prefill \(6{,}000\)--\(15{,}000\) tokens/s, single-stream decode \(200\) tokens/s, batched aggregate decode \(2{,}000\)--\(5{,}000\) tokens/s.
+Llama~3.1~8B on one H100: prefill \(10{,}000\)--\(20{,}000\) tokens/s, single-stream decode \(150\) tokens/s, batched aggregate \(2{,}500\)--\(6{,}000\) tokens/s.
+The batched rates are conservative; production servers often exceed them, which raises the bill.
+
+\paragraph{Bill.}
+GPU-time factor \((T_{\mathrm{serve}} + T_{\mathrm{prove}})/T_{\mathrm{serve}}\), where \(T_{\mathrm{serve}}\) is the request's share of node time.
+The proof covers \(S = P + G\) positions; each request is a single-tenant proof that pays its own weight opening and its recursive compression.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{Proof} & \multicolumn{2}{c}{Bill, single-stream} & \multicolumn{2}{c}{Bill, batched server} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Request (prompt / output) & Base & O & Base & O & Base & O \\
+\midrule
+\multicolumn{7}{@{}l}{\emph{GLM-5.3-Flash, eight RTX PRO 6000}} \\
+\(1\)K / \(256\) & 10 s & 6.5 s & \(8\)--\(9\times\) & \(5\)--\(6\times\) & \(36\)--\(88\times\) & \(23\)--\(55\times\) \\
+\(8\)K / \(512\) & 56 s & 28 s & \(15\)--\(19\times\) & \(8\)--\(10\times\) & \(36\)--\(87\times\) & \(18\)--\(45\times\) \\
+\(32\)K / \(512\) & 3.7 min & 108 s & \(29\)--\(48\times\) & \(14\)--\(24\times\) & \(40\)--\(98\times\) & \(20\)--\(48\times\) \\
+\(128\)K / \(1\)K & 18 min & 9.1 min & \(42\)--\(80\times\) & \(21\)--\(40\times\) & \(50\)--\(124\times\) & \(25\)--\(62\times\) \\
+\midrule
+\multicolumn{7}{@{}l}{\emph{Llama 3.1 8B, one H100}} \\
+\(1\)K / \(256\) & 9.4 s & 4.1 s & \(6\times\) & \(3\times\) & \(47\)--\(101\times\) & \(21\)--\(44\times\) \\
+\(8\)K / \(512\) & 86 s & 38 s & \(21\)--\(24\times\) & \(10\)--\(11\times\) & \(85\)--\(175\times\) & \(38\)--\(78\times\) \\
+\(32\)K / \(512\) & 11 min & 5.6 min & \(99\)--\(130\times\) & \(51\)--\(67\times\) & \(189\)--\(380\times\) & \(97\)--\(195\times\) \\
+\bottomrule
+\end{tabular}
+\caption{GPU-time multiplier for proving every request, central proof cost including recursive compression, baseline and profile~O, Mode~P. The band on unit costs scales the proof column by \([0.5, 2]\). With the shared weight opening of \S\ref{sec:weights} over \(16\) requests, the GLM \(1\)K/\(256\) proof in profile~O drops from \(6.5\) to \(5.2\) seconds and the \(8\)K/\(512\) proof from \(28\) to \(27\); the 8B rows change by \(5\%\) or less.}
+\label{tab:bill}
+\end{table}
+
+\paragraph{Reading the bill.}
+Even with profile~O, proving every request costs about \(3\)--\(11\times\) the GPU time of single-stream serving and \(18\)--\(78\times\) that of a batched server for requests up to \(8\)K tokens, not \(1.5\)--\(5\times\).
+The previous draft compared against single-stream decode, the least efficient way to serve, and priced the proof from a constant borrowed from another system.
+Proving remains affordable where the value of a proof is per request, not per token: at \(\$4.3\)--\(9.9\) per million proven tokens including recursion (profile~O; \(\$9\)--\(20\) baseline), a \(10\)K-token audited interaction costs about \(\$0.04\)--\(0.10\).
+Two deployment patterns follow:
+\begin{itemize}
+\item \emph{Proof on demand.} Serve \(F\) for every request, return a signed receipt, and prove only requests that are disputed or sampled for audit. The server keeps nothing per request: the client resends \((x, y, n_c)\) and the receipt, and the trace is recomputed. A server that cannot predict which requests will be proved must serve \(F\) for all of them, so random audit at rate \(\alpha\) costs \(\alpha\) times the bill and still deters cheating, provided audit requests cannot be told apart from ordinary ones. Because each audit costs the server \(18\)--\(78\times\) the request, audits need a price or a rate limit per client, or they become a denial-of-service lever.
+\item \emph{Proof of every request.} Size the proving fleet at \(18\)--\(62\times\) (profile~O) or \(36\)--\(124\times\) (baseline) the serving fleet for MoE models at batched utilization. Compressed proofs of about \(400\)\,KiB can be returned with the response, stored per request, or published, since they are zero-knowledge.
+\end{itemize}
+Proving adds no latency to the first token or to streaming; the proof is ready \(T_{\mathrm{prove}}\) after the response, plus any queueing in the proving fleet.
+
+\paragraph{Long sessions.}
+By default a proof covers the whole context, so the turns of a conversation, or the steps of an agent, are each proved from the first token, and the cost of a session grows faster than the square of its length.
+A whole-session proof (\S\ref{sec:whole}) proves all turns in one default-mode proof of the final context: a \(16\)-turn session of \(32\)K tokens costs \(\$6.9\) per million tokens for the 8B model instead of \(\$45\). Session mode (\S\ref{sec:incr}) proves each turn as it ends for about the same cost (\(\$7.3\)), with more machinery.
+
+%======================================================================
+\section{Limits and open items}
+\label{sec:limits}
+
+\begin{itemize}
+\item \emph{No implementation.} Unit costs are first-principles estimates with a \([0.5\times, 2\times]\) band. A measured kernel for commit, lookup and zerocheck replaces Table~\ref{tab:units} and leaves the protocol unchanged.
+\item \emph{Accuracy of \(F\).} Power-of-two per-column weight scales, static \(Q/K/V\), \(10\)-bit attention probabilities (the most likely failure at long context, where diffuse heads lose the mass of keys below about \(2^{-11}\) of the maximum; the \(12\)-bit option of \S\ref{sec:attn} is the remedy), \(12\)-bit sampling probabilities, and integer KDA over long sequences (including its per-step decay range \([e^{-2}, e^{-2^{-12}}]\), which caps a channel's memory at a half-life of about \(2{,}800\) tokens, and its \(8\)-bit state in the output product) must be validated against the BF16 model (perplexity, GPQA, IFEval, long-context retrieval) before deployment. Non-power-of-two weight scales are available through \(\mathsf{MulRound}\) at about \(+15\%\) work.
+\item \emph{Profile~O.} \(F_O\) quantizes the up projection to \(8\) bits before the gated product, rounds \(Q/K/V\) once from the accumulator, and applies RoPE after quantization; its accuracy needs the same validation as \(F\). The rate-\(1/2\) and small-value cost factors are estimates and account for about a third of profile~O's gain.
+\item \emph{GLM-5.3-Flash} shapes beyond the published fields are assumptions (\S\ref{sec:proj}). Its KDA and indexer gadgets are specified at constraint level (\S\ref{sec:kda}, \S\ref{sec:dsa}) for an assumed architecture: the gated recurrence without the delta rule, per-head output normalization, and pooling by sum. If the deployed model uses the delta rule, \(F\) needs a per-chunk triangular solve that is not specified, and its KDA work would be roughly \(2\)--\(3\times\) larger.
+\item \emph{Mode~C} rests on a conjecture; Mode~P does not. Mode~C saves only about \(5\%\) and is not recommended.
+\item \emph{Recursion} (\S\ref{sec:recursion}) adds the heuristic of instantiating BLAKE3 inside the circuit; the main proof avoids it. The outer circuits are specified at the level of components, not constraints, and their cost is the least certain term in the model (\(2\)--\(18\%\) of the main proof). \(h_{\mathrm{rec}}\) must be published in the registry with each model release.
+\item \emph{Grinding.} The lookup term and the query terms rely on grinding (\(11\) and \(30\) bits), which counts toward security only in the convention that charges an attacker per hash call (Table~\ref{tab:budget}).
+\item \emph{Shared weight opening} shares only the opening; sharing the claim reduction as well is not specified.
+\item \emph{Open components:} the ZK mode (\S\ref{sec:zk}), and with it multi-tenant proofs and proofs of secret weights.
+\item \emph{Session mode} (\S\ref{sec:incr}) rests on Theorem~\ref{thm:session} and on the state list of Lemma~\ref{lem:suff}. Both are proof sketches at the level of the rest of this document and need independent review before use. The argument depends on the per-call convention and on straight-line extraction for the outer layers, as recursion does. A turn's guarantee depends on the whole chain of earlier turns. The whole-session proof (\S\ref{sec:whole}) has none of these dependencies and is the default.
+\item \emph{Not supported by \(F\):} top-\(p\) sampling; repetition, presence and frequency penalties; logit bias; grammar-constrained decoding (JSON mode, tool-call schemas); stop strings that span tokens; online Hadamard rotations; vision and audio encoders. Each changes the logits or the sampler and needs its own gadget. A grammar constraint, for example, needs a committed automaton state per generated token.
+\item \emph{Operations:} a registry of canonical \((C_W, h_{\mathrm{circ}})\) per model release (\S\ref{sec:weights}); codeword storage for every auditable model version; receipt keys; audit pricing; client software that checks tokenizer, template and server-prefix provenance.
+\end{itemize}
+
+\begin{thebibliography}{99}
+\bibitem{thaler} J.~Thaler. \emph{Proofs, Arguments, and Zero-Knowledge}. 2022.
+\bibitem{logup} U.~Hab\"ock. Multivariate lookups based on logarithmic derivatives. ePrint 2022/1530.
+\bibitem{logupgkr} S.~Papini and U.~Hab\"ock. Improving logarithmic derivative lookups using GKR. ePrint 2023/1284.
+\bibitem{basefold} H.~Zeilberger, B.~Chen, B.~Fisch. BaseFold: efficient field-agnostic polynomial commitment schemes from foldable codes. CRYPTO 2024.
+\bibitem{whir} G.~Arnon, A.~Chiesa, G.~Fenzi, E.~Yogev. WHIR: Reed--Solomon proximity testing with super-fast verification. EUROCRYPT 2025.
+\bibitem{bciks} E.~Ben-Sasson, D.~Carmon, Y.~Ishai, S.~Kopparty, S.~Saraf. Proximity gaps for Reed--Solomon codes. FOCS 2020.
+\bibitem{cfs} A.~Chiesa, M.~Forbes, N.~Spooner. A zero knowledge sumcheck and its applications. ePrint 2017/305.
+\bibitem{libra} T.~Xie, J.~Zhang, Y.~Zhang, C.~Papamanthou, D.~Song. Libra: succinct zero-knowledge proofs with optimal prover computation. CRYPTO 2019.
+\bibitem{gruen} A.~Gruen. Some improvements for the PIOP for ZeroCheck. IACR ePrint, 2024.
+\bibitem{smallsc} S.~Bagad, Q.~Dao, Y.~Domb, J.~Thaler. Speeding up sum-check proving. IACR ePrint, 2025.
+\bibitem{attestable} Attestable. Proving LLMs at scale. \url{https://attestable.com/blog/proving-llms-scale}, 2026.
+\bibitem{glm} Z.ai, GLM-5.3-Flash configuration as cited in the previous draft: 45 layers, hidden size 4096, 288 routed experts, top-8, one shared expert, 34 KDA and 11 sparse layers, indexer top-2048, pool factor 4, 320B total and 18B active parameters.
+\end{thebibliography}
+
+\end{document}
