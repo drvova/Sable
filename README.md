@@ -234,7 +234,7 @@ configuration measured in the paper.
 | `tests/` | unit, end-to-end and forgery tests on tiny models |
 | `scripts/` | quantization, benchmarks and accuracy (`scripts/paths.py` resolves the inputs) |
 | `costmodel/` | the analytical cost model the prover is measured against |
-| `lisp/` | a Common Lisp (SBCL) port of the host-side core: field tower, transcript, proof format, Reed-Solomon code, sumcheck verifier (see `lisp/README.md`) |
+| `lisp/` | a Common Lisp (SBCL) port of the host-side verifier, with CPU reference provers: field tower, transcript, proof format, Reed-Solomon code, sumcheck, LogUp-GKR, domains, the polynomial commitment and the statement; the per-layer steps of `llm.verify` are not ported yet (see `lisp/README.md`) |
 | `docs/spec/corrected.tex` | an early design specification of the system; its first 1,024 tokens are the F_O calibration text |
 | `paper/sable.pdf` | the paper |
 

@@ -1,7 +1,8 @@
 # Sable in Common Lisp (SBCL)
 
-A port of Sable's host-side core from Python (`zk/`) to Common Lisp, built into an SBCL image.
-It has no dependencies beyond SBCL and the ASDF and `sb-introspect` that ship with it.
+A port of Sable's host-side verifier from Python (`zk/`) to Common Lisp, built into an SBCL
+image, with a CPU reference prover for every protocol it verifies. It has no dependencies beyond
+SBCL and the ASDF and `sb-introspect` that ship with it.
 
 The interface is Lisp code itself:
 
@@ -18,7 +19,26 @@ the Python code and writes `tests/vectors.sexp`, and the Lisp tests reproduce ev
 That covers field arithmetic, BLAKE3 in both modes, transcript challenges, proof bytes,
 polynomials, Reed-Solomon codewords and folds, and whole sumcheck proofs. For the sumcheck, the
 Lisp prover writes the same proof bytes as the Python prover, and the Lisp verifier accepts the
-Python proofs.
+Python proofs. The larger protocols are checked the other way round: `make crosscheck` has the
+original verifiers check the Lisp prover's proofs, and every forgery of them.
+
+## Status
+
+| Part | State | Checked against |
+|---|---|---|
+| Field tower, BLAKE3, transcript, proof format, Reed-Solomon | ported | `tests/vectors.sexp` from the Python code |
+| Sumcheck (verifier and prover) | ported, optimised (steps 1–6 of the plan) | Python's proofs, byte for byte |
+| LogUp-GKR | ported | `vc_gkr_upper` in `zk/cuda/vcore.cpp`: 8 shapes, 231 forgeries |
+| Domains | ported | `zk/domain.py`'s verifier: 16 domains |
+| Polynomial commitment (BaseFold) | ported | `zk/gpcs.py`'s verifier: 3 scenarios, 287 forgeries |
+| Statement, policy, sampling seed, C_W, commitment layout | ported | `zk/llm.py`: 18 layouts, 9 statements, 10 checks |
+| Per-layer steps of `llm.verify` | not yet | a host-verifier trace from `tests/gpu-trace.py` (needs a GPU run) |
+| GPU prover | not planned | |
+
+So the Lisp code cannot yet verify a whole proof of a model: every protocol that proof is made
+of is ported and checked, but not the per-layer steps that put them together. The plan behind the
+optimisations, and the papers it draws on, is in
+[`reports/Sable Lisp optimization research.md`](../reports/Sable%20Lisp%20optimization%20research.md).
 
 ## Forms
 
@@ -76,7 +96,9 @@ Compiling a kernel takes 8–20 ms, once per statement. A statement whose kernel
 `*kernel-size-limit*` uses the generic loop instead, and a test checks that both give the same
 proofs.
 
-Best of 7 runs, F_p^8:
+## Performance
+
+The sumcheck prover after each step of the plan. Best of 7 runs, F_p^8:
 
 | Prover run | Field rewrite (steps 1–2) | Flat tables (step 3) | Round kernels (step 4) | Split eq (step 5) |
 |---|---|---|---|---|
@@ -116,8 +138,10 @@ Base tables, best of 3:
 That is 1.4–1.65× in F_p^8 and 1.15× in F_p^4. The cost model of ePrint 2024/1046 predicts 1.85×
 and 1.31× at degree 2.
 
-The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
-on symbolic coordinates:
+## The field tower
+
+The field tower is generated the same way as the sumcheck kernels. `mul*` and `inv*` define
+multiplication and inversion once, on symbolic coordinates:
 
 - **`mul*`** uses the fact that the tower of degree D is F_p[w]/(w^D - 3) for its top generator w,
   with the coordinates in bit-reversed order. So it is the schoolbook product. Each output
@@ -162,7 +186,9 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
 workaround is not needed: a layer parameter is just another variable.
 
-**LogUp-GKR.** `verify-upper` checks the upper layers of the fraction trees, batched over the
+### LogUp-GKR
+
+`verify-upper` checks the upper layers of the fraction trees, batched over the
 lookups:
 
 - **Roots and top tree:** the proof sends each lookup's root fraction, then proves each layer from
@@ -190,7 +216,9 @@ non-powers of two), 1 to 3 lookups, and F_p^4 and F_p^8. It then checks each wit
 The Lisp tests add LogUp's meaning: each root fraction equals the sum of its leaf fractions, and
 the claims equal the multilinear extension of the leaves' parent layer.
 
-**Domains.** A domain is K blocks of 2^n elements with base-field columns, zerocheck constraints
+### Domains
+
+A domain is K blocks of 2^n elements with base-field columns, zerocheck constraints
 and lookups, written as data. The constraints and the lookups' tags, values and numerators are
 forms over the column names:
 
@@ -223,7 +251,9 @@ blocks, every column kind, no lookups or no constraints, and F_p^4 and F_p^8.
   lookup uses. Such a final only becomes that column's claim, which the commitment's opening
   checks, and the Lisp verifier treats it the same way.
 
-**The polynomial commitment.** `pcs.lisp` ports `zk/gpcs.py`, the mixed-length BaseFold opening
+### The polynomial commitment
+
+`pcs.lisp` ports `zk/gpcs.py`, the mixed-length BaseFold opening
 over rate-1/2 Reed-Solomon codes and BLAKE3 Merkle trees, with the same calls:
 `pcs-declare`, `pcs-merge`, `pcs-segment-decl`, `pcs-commit`, `pcs-open`, `pcs-segment` and
 `pcs-finish`.
@@ -257,7 +287,9 @@ grinding may still accept, and the empty paths of trees whose cap is their leave
 6 queries and 4 bits of grinding instead of 153 and 30: grinding 30 bits on the CPU takes hours.
 Python's verifier takes both as parameters too.
 
-**The transformer protocol's outer layer.** `llm.lisp` ports the parts of `llm.verify` that
+### The transformer protocol
+
+`llm.lisp` ports the parts of `llm.verify` that
 come before and around the per-layer steps, with the same bytes:
 
 - the statement (`P|` policy, C_W, h_circ from the configuration's `repr`, the shape and the
@@ -281,7 +313,7 @@ LogUp-GKR, sumchecks, the commitment's calls) with its inputs, outputs and trans
 and which protocol step moved the transcript. That trace is what the step bodies will be ported
 and checked against. The script has not been run yet: this environment has no GPU.
 
-Not ported yet:
+### Not ported yet
 
 - **The per-layer steps of `llm.verify` (`Proto.run`):** the F_O model's domains of each unit,
   their claims and how they reach the commitment. Everything they are built from is ported: the
@@ -302,6 +334,19 @@ make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.
                 #   and zk/llm.py (also PyTorch: make crosscheck PYTHON=...)
 ```
 
+On a machine with an NVIDIA GPU, from the repository root, prove a tiny model and trace the host
+verifier on it (`--model tiny`, `qwen3` or `moe`; see the script's docstring for the files):
+
+```bash
+python lisp/tests/gpu-trace.py all OUT --model tiny
+```
+
+The `trace` half needs no GPU, so `OUT` can be traced again anywhere:
+
+```bash
+python lisp/tests/gpu-trace.py trace OUT
+```
+
 ## Use
 
 `sable` reads Lisp forms and evaluates them in `sable-user`, which uses every Sable package:
@@ -310,6 +355,8 @@ make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.
 sable '(describe-proof (read-proof-file "/data/proof_1x4096.proof"))'
 sable '(normalize (quote (* (+ c0 3) (- c1 c0))))'
 sable '(demo :statement (quote (* t0 t1 t2)) :variables 14 :base t)'
+sable '(let ((c (make-cfg :l 2 :d 256 :nh 4 :nkv 2 :dh 128 :dff 384 :v 1024)))
+         (length (getf (commitment-layout c (make-shape c 2 256 7 7 16)) :groups)))'
 sable '(run-tests)'
 sable - < script.lisp        # forms from standard input
 sable                        # a REPL, on a terminal
