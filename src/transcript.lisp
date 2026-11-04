@@ -17,7 +17,7 @@
            #:transcript-position #:transcript-sent-bytes #:transcript-state #:transcript-finished-p
            #:absorb #:send #:send-bytes #:record #:record-bytes
            #:squeeze #:challenge-base #:challenge #:challenges #:challenge-bits
-           #:check-grind #:grind #:verify-grind #:label-name))
+           #:check-grind #:grind #:verify-grind #:label-name #:split-string))
 
 (in-package #:exacta.transcript)
 

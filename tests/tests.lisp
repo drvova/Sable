@@ -903,13 +903,15 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
   '((export-gkr-cases "100cba9c4c818c1d2bb79467fe807ed3f7f7054274b5331cb7c22f78bd538320")
     (export-domain-cases "7a53788916a303f668251d4e05b22085efcb4d57813bc58a0f93e7f214cbcf12")
     (export-pcs-cases "6ade2c3e6acad8ce06eea085b01b9534d625ff4476f7d970a2b3376949378d37")
-    (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7"))
+    (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
+    (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
 rejected 287 forgeries, and zk/llm.py computed the same 18 layouts, 9 statements and seeds,
-10 statement checks and C_W.  The files differ from those only in the proof magic (EXACTPF1 for
-SABLEPF1).")
+10 statement checks and C_W; and zk/proto.py's Ctx replayed the context scenario, computed the
+same values and rejected its 95 forgeries.  The files differ from those only in the proof magic
+(EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
   (dolist (case *frozen-cases*)
@@ -923,3 +925,204 @@ SABLEPF1).")
           (assert (string= (format nil "~(~{~2,'0X~}~)" (coerce (exacta.sha256:sha256 octets) 'list))
                            digest)
                   () "~A: the cases differ from those the original code checked" export))))))
+
+;;; ------------------------------------------------------------------ the protocol context
+
+(defparameter *proto-groups*
+  '(("g0" ("a" 6 3) ("u" 3 4 :no-pack))
+    ("g1" ("w" 4 4 (2 2)) ("b" 1 5)))
+  "Commitment groups: a is packed into one row (claims become weighted claims), w into two columns
+of two blocks, u is not packed, b has one block.")
+
+(defparameter *proto-cmax* 7)
+(defparameter *proto-kco* 17 "The layer parameter Kco of the scenario's domain.")
+
+(defun proto-data (state)
+  "Random tensor data for *PROTO-GROUPS*, and the sumcheck's and the domain's tables."
+  (flet ((rand (n) (coerce (loop repeat n collect (random +p+ state)) 'vector))
+         (small (n) (coerce (loop repeat n collect (random 50 state)) 'vector)))
+    (let ((x (small 16)))
+      (append (loop for (nil . items) in *proto-groups*
+                    append (loop for (name k c) in items collect (cons name (rand (* k (expt 2 c))))))
+              (list (cons "t0" (rand 24)) (cons "t1" (rand 6)) (cons "t2" (rand 2))
+                    (cons "s0" (rand 2)) (cons "s1" (rand 2))
+                    (cons "x" x)
+                    (cons "y" (map 'vector (lambda (v) (mod (+ (* v v) *proto-kco*) +p+)) x)))))))
+
+(defun data-of (name data) (cdr (assoc name data :test #'equal)))
+
+(defun tensor-mle (values k c point)
+  "The MLE of a tensor of K blocks of 2^c values at POINT (c + nbits K EXTs), absent blocks zero."
+  (let ((padded (make-array (expt 2 (+ c (exacta.proto:nbits k))) :initial-element 0)))
+    (replace padded values)
+    (mle-eval padded point 4)))
+
+(defun proto-domain (data)
+  (exacta.domain:make-domain
+   :name "toy.dom" :n 3 :blocks 2
+   :columns `((x :data ,(data-of "x" data)) (y :data ,(data-of "y" data)))
+   :constraints '((- y (* x x) kco))
+   :lookups '((:tag 5 :values (x)) (:tag 9 :values (y) :dynamic t) (:tag 9 :values (y) :num -1))
+   :parameters `((kco . ,*proto-kco*))))
+
+(defun proto-sumcheck-claim (context statement tables k n eq weights constants)
+  "The honest claim sum_b bw_b sum_x w(x) F(tables(x, b))."
+  (let ((full (loop for (symbol kind c shared data) in tables
+                    collect (cons symbol (exacta.proto::full-table kind c shared data k n)))))
+    (if (exacta.proto:prover-p context)
+        (make-ext 4)
+        (reduce #'ext+ (loop for b below k
+                             collect (let ((s (exacta.sumcheck:hypercube-sum
+                                               (exacta.proto::strip-pieces statement) n
+                                               (loop for (symbol . values) in full
+                                                     collect (cons symbol (subseq values (* b (expt 2 n)) (* (1+ b) (expt 2 n)))))
+                                               4 :eq eq :constants constants)))
+                                       (if weights (ext* s (elt weights b)) s)))
+                :initial-value (make-ext 4)))))
+
+(defun proto-scenario (context data)
+  "Every operation of the context, in order; returns what each produced (for the verifier, what
+Sable's Ctx must produce too).  DATA stands in, for the verifier, for the earlier steps that would
+have given it the claimed values."
+  (let ((out '())
+        (tr (exacta.proto:context-tr context))
+        (prover (exacta.proto:prover-p context)))
+    (flet ((note (key value) (push (cons key value) out)))
+      (loop for (g . items) in *proto-groups* do (exacta.proto:declare-group context g items))
+      (loop for (g . items) in *proto-groups*
+            do (exacta.proto:commit-group context g (and prover (loop for (name) in items collect (assoc name data :test #'equal)))))
+      (setf (exacta.proto:context-assign context)
+            (exacta.proto:parse-assign (send-bytes tr (and prover (exacta.proto:assign-octets '((("toy.dom" 0) . 0)))))))
+      (exacta.proto:draw-lookup-challenges context)
+      ;; claims
+      (let ((pa (exacta.proto:context-challenge context 6))
+            (pu (exacta.proto:context-challenge context 6))
+            (pw (exacta.proto:context-challenge context 4))
+            (pb (exacta.proto:context-challenge context 5))
+            (wb (exacta.proto:context-challenge context)))
+        (let ((va (tensor-mle (data-of "a" data) 6 3 pa))
+              (vu (tensor-mle (data-of "u" data) 3 4 pu))
+              (vw (coerce (loop for b below 4 collect (mle-eval (subseq (data-of "w" data) (* b 16) (* (1+ b) 16)) pw 4)) 'vector))
+              (vb (ext* wb (mle-eval (data-of "b" data) pb 4))))
+          (note :inputs (list va vu vw vb))
+          (note :a (exacta.proto:point-claim context "a" pa :value va :data (data-of "a" data)))
+          (note :u (exacta.proto:point-claim context "u" pu :value vu :data (data-of "u" data)))
+          (exacta.proto:claim context "w" pw vw)
+          (exacta.proto:claim context "w" pw (list (cons 0 (aref vw 0)) (cons 3 (aref vw 3))))
+          (exacta.proto:weighted-claim context "b" pb (list (cons 0 wb)) vb)))
+      ;; sumchecks: Prog-style pieces, ROW/COL/shared tables, blocks with weights, eq mode; then the
+      ;; same products as one piece (zk/'s terms) and as two (a Prog), whose header degrees differ
+      (let* ((eq (exacta.proto:context-challenge context 3))
+             (bw (exacta.proto:context-challenge context 3))
+             (c0 (exacta.proto:context-challenge context))
+             (tables `((t0 :full 0 nil ,(data-of "t0" data)) (t1 :row 2 nil ,(data-of "t1" data))
+                       (t2 :col 1 t ,(data-of "t2" data))))
+             (statement `(+ (* c0 ,(exacta.proto:piece '(* t0 t1))) ,(exacta.proto:piece '(* t2 t2))))
+             (constants `((c0 . ,c0))))
+        (let ((claim (proto-sumcheck-claim context statement tables 3 3 eq bw constants)))
+          (multiple-value-bind (rho finals)
+              (exacta.proto:run-sumcheck context "sc-a" 3 3 statement claim tables
+                                         :eq eq :block-weights bw :constants constants)
+            (note :sc-a (list claim rho finals)))))
+      (dolist (style '(:terms :prog))
+        (let* ((tables `((s0 :col 1 nil ,(data-of "s0" data)) (s1 :row 2 nil ,(data-of "s1" data))))
+               (statement (if (eq style :terms)
+                              (exacta.proto:piece '(* s0 s1))
+                              `(* ,(exacta.proto:piece 's0) ,(exacta.proto:piece 's1)))))
+          (let ((claim (proto-sumcheck-claim context statement tables 1 3 nil nil nil)))
+            (multiple-value-bind (rho finals)
+                (exacta.proto:run-sumcheck context (format nil "sc-~(~A~)" style) 3 1 statement claim tables)
+              (note style (list (exacta.proto:sumcheck-degree statement tables 3) claim rho finals))))))
+      ;; a domain: a constraint with a layer parameter, a lookup into the table, a dynamic pair
+      (let ((routes '()))
+        (exacta.proto:run-domain context (proto-domain data)
+                                 (loop for name in '(x y)
+                                       collect (let ((name name))
+                                                 (cons name (lambda (point value) (push (list name point value) routes))))))
+        (note :domain (reverse routes)))
+      (dolist (g *proto-groups*) (exacta.proto:open-group context (car g)))
+      (pcs-finish* context)
+      (unless prover
+        (exacta.proto:check-lookup-sets context)
+        (note :chunk-sum (gethash 0 (exacta.proto::context-chunk-sums context))))
+      (reverse out))))
+
+(defun pcs-finish* (context) (exacta.pcs:pcs-finish (exacta.proto:context-pcs context)))
+
+(defun proto-run (data &optional messages)
+  "The scenario as the prover (no MESSAGES) or as the verifier of MESSAGES."
+  (let* ((tr (if messages
+                 (make-transcript "proto-test" 4 :messages messages)
+                 (make-transcript "proto-test" 4)))
+         (context (exacta.proto:make-context (if messages :verify :prove) tr
+                                             :cmax *proto-cmax* :queries 6 :grind 4)))
+    (values (proto-scenario context data) tr)))
+
+(defun test-proto-roundtrip ()
+  (let ((data (proto-data (sb-ext:seed-random-state 61))))
+    (multiple-value-bind (proved tr) (proto-run data)
+      (declare (ignore proved))
+      (let ((messages (transcript-messages tr)))
+        (multiple-value-bind (out vtr) (proto-run data messages)
+          (assert (transcript-finished-p vtr))
+          (assert (equal (mapcar #'car out) '(:inputs :a :u :sc-a :terms :prog :domain :chunk-sum)))
+          ;; the header degrees of the two styles
+          (assert (= (first (cdr (assoc :terms out))) 1))
+          (assert (= (first (cdr (assoc :prog out))) 2)))
+        ;; a changed field value or byte anywhere is rejected
+        (let ((rejected 0) (accepted '()) (state (sb-ext:seed-random-state 7)))
+          (loop for i below (length messages)
+                for m = (aref messages i)
+                when (and (typep m 'field-array) (plusp (array-total-size m)))
+                  do (let ((bad (copy-seq messages))
+                           (m2 (make-array (array-dimensions m) :element-type (array-element-type m)))
+                           (j (random (array-total-size m) state)))
+                       (dotimes (x (array-total-size m)) (setf (row-major-aref m2 x) (row-major-aref m x)))
+                       (setf (row-major-aref m2 j) (mod (1+ (row-major-aref m j)) +p+))
+                       (setf (aref bad i) m2)
+                       (if (signalled 'exacta-error (lambda () (proto-run data bad)))
+                           (incf rejected)
+                           (push i accepted))))
+          (assert (null accepted) () "forgeries accepted at messages ~A" accepted)
+          (assert (plusp rejected)))))))
+
+(defun json-ext (e) (json-ints e))
+(defun json-point (point) (format nil "[~{~A~^,~}]" (mapcar #'json-ext point)))
+(defun json-vector (values) (format nil "[~{~A~^,~}]" (map 'list #'json-ext values)))
+
+(defun export-proto-cases (path)
+  "Write the context scenario's proof, its inputs and what Exacta's verifier computed, as JSON.
+Sable's Ctx (zk/proto.py) replayed exactly this; TEST-FROZEN-CASES pins it."
+  (let ((data (proto-data (sb-ext:seed-random-state 61))))
+    (multiple-value-bind (proved tr) (proto-run data)
+      (declare (ignore proved))
+      (let* ((messages (transcript-messages tr))
+             (out (proto-run data messages)))
+        (flet ((noted (key) (cdr (assoc key out))))
+          (with-open-file (s path :direction :output :if-exists :supersede)
+            (destructuring-bind (va vu vw vb) (noted :inputs)
+              (format s "{\"proof\": \"~(~{~2,'0X~}~)\",~%\"cmax\": ~D, \"queries\": 6, \"grind\": 4, \"kco\": ~D,~%"
+                      (coerce (exacta.proofio:encode-proof messages) 'list) *proto-cmax* *proto-kco*)
+              (format s "\"groups\": [~{~A~^,~}],~%"
+                      (loop for (g . items) in *proto-groups*
+                            collect (format nil "[\"~A\", [~{~A~^,~}]]" g
+                                            (loop for (name k c shape) in items
+                                                  collect (format nil "[\"~A\", ~D, ~D, ~A]" name k c
+                                                                  (cond ((eq shape :no-pack) "\"no-pack\"")
+                                                                        (shape (json-ints shape))
+                                                                        (t "null")))))))
+              (format s "\"values\": {\"a\": ~A, \"u\": ~A, \"w\": ~A, \"b\": ~A},~%"
+                      (json-ext va) (json-ext vu) (json-vector vw) (json-ext vb))
+              (format s "\"a\": ~A, \"u\": ~A,~%" (json-ext (noted :a)) (json-ext (noted :u)))
+              (destructuring-bind (claim rho finals) (noted :sc-a)
+                (format s "\"sc-a\": {\"claim\": ~A, \"rho\": ~A, \"finals\": [~{~A~^,~}]},~%"
+                        (json-ext claim) (json-point rho) (mapcar #'json-vector finals)))
+              (dolist (style '(:terms :prog))
+                (destructuring-bind (degree claim rho finals) (noted style)
+                  (format s "\"sc-~(~A~)\": {\"degree\": ~D, \"claim\": ~A, \"rho\": ~A, \"finals\": [~{~A~^,~}]},~%"
+                          style degree (json-ext claim) (json-point rho) (mapcar #'json-vector finals))))
+              (format s "\"domain\": [~{~A~^,~}],~%"
+                      (loop for (name point value) in (noted :domain)
+                            collect (format nil "[\"~(~A~)\", ~A, ~A]" name (json-point point) (json-vector value))))
+              (format s "\"chunk_sum\": ~A}~%" (json-ext (noted :chunk-sum)))))))))
+  path)

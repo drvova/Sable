@@ -25,7 +25,7 @@
   (:use #:cl #:exacta.util #:exacta.conditions #:exacta.field #:exacta.forms #:exacta.transcript
         #:exacta.blake3 #:exacta.rs #:exacta.sumcheck)
   (:export #:make-pcs #:pcs-declare #:pcs-merge #:pcs-segment-decl #:pcs-commit #:pcs-open
-           #:pcs-segment #:pcs-finish #:pcs-nv #:+cmin+ #:+caplog+ #:+flog+))
+           #:pcs-segment #:pcs-finish #:pcs-nv #:pcs-cmax #:+cmin+ #:+caplog+ #:+flog+))
 
 (in-package #:exacta.pcs)
 

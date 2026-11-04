@@ -45,7 +45,8 @@ that way without Python:
 | Domains | done | `zk/domain.py`'s verifier: 16 domains |
 | Polynomial commitment (BaseFold) | done | `zk/gpcs.py`'s verifier: 3 scenarios, 287 forgeries |
 | Statement, policy, sampling seed, C_W, commitment layout | done | `zk/llm.py`: 18 layouts, 9 statements, 10 checks |
-| Per-layer steps of the model's proof | not yet | |
+| Protocol context (claims, packing, domains and sumchecks in a step, LogUp sets) | done (stage 8a) | `zk/proto.py`'s `Ctx`: one scenario, 95 forgeries |
+| Per-layer steps of the model's proof | in progress (stages 8b–8e) | |
 | Prover for whole models | not yet | |
 
 So Exacta cannot yet verify a whole proof of a model. Every protocol that proof is made of is
@@ -195,6 +196,7 @@ The second column names the Sable code that each file reimplements.
 | `domain.lisp` | `zk/domain.py` | a domain (columns, zerocheck constraints, lookups) as data; its leaf-layer and zerocheck statement as one form; `verify-domain` and a CPU reference prover `prove-domain` |
 | `pcs.lisp` | `zk/gpcs.py` | the polynomial commitment: units and size classes, merged mixed-height Merkle trees with caps, the per-class point reductions, segments, the cross-unit sumcheck, BaseFold with oracles, grinding and the query checks; a CPU reference prover |
 | `sha256.lisp` | `hashlib.sha256` | SHA-256 (FIPS 180-4), for the statement's digests |
+| `proto.lisp` | `zk/proto.py` (`Ctx`, `Pack`), `logup.parse_assign` | the protocol context the steps share, in `:commit`, `:prove` and `:verify` mode: tensors and their packing, block, point and weighted claims, group openings, `run-domain` with the LogUp root sums and `check-lookup-sets`, `run-sumcheck` with zk/'s header-degree rules (`piece`, `sumcheck-degree`), virtual claims |
 | `llm.lisp` | the outer layer of `zk/llm.py`, `zk/proto.py` | the transformer protocol's public side: `make-cfg`, `make-shape`, `column-block-bits`, the commitment layout (`commitment-layout`: groups, packing, merge sets, segments, weight groups; `declare-units`), the policy and its encoding, `check-statement`, `statement`, `sampling-seed`, `weights-digest` (C_W) |
 | `toplevel.lisp` | | the executable: evaluates forms in `exacta-user`; `(help)` |
 
@@ -319,11 +321,39 @@ Sable's `zk/llm.py` computed the same values (pinned in `test-frozen-cases`): 18
 tiny test models, and Qwen2.5-32B, Qwen3-32B and Qwen3-30B-A3B at the paper's shapes, up to 1029
 groups and 16830 items), 9 statements, policies and sampling seeds, 10 statement checks and C_W.
 
+### The protocol context
+
+Every step of the model's proof works through one context (`proto.lisp`, Sable's `Ctx`). It
+holds the declared tensors and the claims made on them until their group is opened, runs the
+step's domains and sumchecks, and keeps the LogUp sums the verifier checks at the end:
+
+- **Packing:** a tensor of many small blocks is committed as wider columns. A claim on it is
+  rewritten to claims on those columns: one random combination per column whose blocks are all
+  claimed, and per-block claims for the others.
+- **Point claims:** a claim on a whole tensor sends each block's value at the in-block point, or
+  becomes one weighted claim when the tensor is packed in a single row.
+- **Lookups:** each table lookup's root fraction joins the sum of the chunk it was assigned to.
+  The roots of dynamic lookups, and of lookups with a numerator, join their tag's set, which must
+  sum to zero.
+- **Sumcheck degrees:** the header states Sable's degree, not the true one. A `piece` (one of
+  Sable's `Prog` polynomials, or a whole sum of terms) counts per round only the tables that vary
+  in that round, maximised over the rounds; products of pieces add their degrees.
+
+Domains may use the layer parameters (Kco, Kcd, Dyn, Dme), which `make-domain` substitutes.
+
+**Checked by Sable's `Ctx`.** One scenario covers every operation: packed and unpacked tensors,
+full and partial claims on packed columns, a sumcheck with ROW, COL and shared tables over three
+weighted blocks, both degree rules, and a domain with a layer parameter, a table lookup and a
+dynamic pair. Sable's `Ctx` replays Exacta's proof, consumes all 103 messages, computes the same
+values and rejects all 95 forgeries; so does Exacta's verifier (`test-proto-roundtrip`).
+
 ### Not done yet
 
 - **The per-layer steps of the model's proof (Sable's `Proto.run`):** the F_O model's domains of
   each unit, their claims and how they reach the commitment. Everything they are built from is
-  done: the sumcheck, LogUp-GKR, domains, the commitment and the outer layer. `read-proof-file`
+  done: the sumcheck, LogUp-GKR, domains, the commitment, the outer layer and the protocol
+  context. The remaining stages are 8b (the LogUp table side and public MLEs), 8c (the F_O
+  model's data and per-layer witness), 8d (each unit's steps) and 8e (whole proofs, then MoE). `read-proof-file`
   parses a real Sable proof, but cannot verify it yet. The reference for this work is Sable's code
   at commit 81807ef. That commit also has `lisp/tests/gpu-trace.py`, which runs Sable's GPU
   prover on a tiny model and records every sub-protocol call of its host verifier, so each step

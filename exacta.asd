@@ -24,6 +24,7 @@ commitment and the transformer statement.  Ported from Sable's Python implementa
                (:file "gkr")
                (:file "domain")
                (:file "pcs")
+               (:file "proto")
                (:file "llm")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "exacta/tests"))))

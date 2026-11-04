@@ -14,6 +14,10 @@
 ;;;; Column kinds: :FULL (every variable), :ROW c (the variables from c on), :COL c (the variables
 ;;;; below c); a SHARED column is the same in every block.  With MERGE, the block index is bound
 ;;;; inside the protocol (a second sumcheck), and the claims are single values.
+;;;;
+;;;; Forms may use layer parameters (zk/poly.py lparam: Kco, Kcd, Dyn, Dme), constants of the layer
+;;;; being proved; MAKE-DOMAIN substitutes their values.  A lookup marked :DYNAMIC, or with a
+;;;; numerator, is not a lookup into the global table: its root joins its tag's set (proto.lisp).
 
 (defpackage #:exacta.domain
   (:use #:cl #:exacta.util #:exacta.conditions #:exacta.field #:exacta.forms #:exacta.transcript
@@ -32,12 +36,20 @@
 (defstruct (domain (:constructor %make-domain (name n blocks merge columns constraints lookups)))
   name n blocks merge columns constraints lookups)
 
-(defun make-domain (&key name n (blocks 1) merge columns constraints lookups)
+(defun make-domain (&key name n (blocks 1) merge columns constraints lookups parameters)
   "A domain of BLOCKS blocks of 2^N elements.  COLUMNS: (name &key (kind :full) (c 0) shared data),
 DATA a vector of base elements (K 2^n for :FULL, K 2^(n-c) for :ROW c, K 2^c for :COL c; without
 the factor K if SHARED; needed by the prover only).  CONSTRAINTS: forms over the column names that
-must vanish everywhere.  LOOKUPS: plists (:tag form :values (form ...) :num form)."
+must vanish everywhere.  LOOKUPS: plists (:tag form :values (form ...) :num form :dynamic bool).
+PARAMETERS: an alist (symbol . integer) of layer parameters, substituted into the forms."
   (check-parameter n (lambda (n) (and (integerp n) (>= n 2))) "at least 2")
+  (when parameters
+    (flet ((bind (form) (sublis parameters form)))
+      (setf constraints (mapcar #'bind constraints)
+            lookups (loop for lookup in lookups
+                          collect (destructuring-bind (&key tag values num dynamic) lookup
+                                    (list :tag (bind tag) :values (mapcar #'bind values)
+                                          :num (and num (bind num)) :dynamic dynamic))))))
   (%make-domain name n blocks merge
                 (loop for (column-name . options) in columns
                       collect (destructuring-bind (&key (kind :full) (c 0) shared data) options

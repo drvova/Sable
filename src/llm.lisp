@@ -8,7 +8,7 @@
 ;;;; tiny model and records every sub-protocol's inputs and outputs in the host verifier.
 
 (defpackage #:exacta.llm
-  (:use #:cl #:exacta.util #:exacta.conditions #:exacta.sha256)
+  (:use #:cl #:exacta.util #:exacta.conditions #:exacta.sha256 #:exacta.proto)
   (:export #:cfg #:make-cfg #:cfg-repr #:shape #:make-shape #:column-block-bits
            #:commitment-layout #:declare-units
            #:policy #:make-policy #:encode-policy #:check-statement
@@ -24,8 +24,6 @@
 (defconstant +table-rows+ 26 "tables.LOG_ROWS: the LogUp table has 2^26 rows.")
 (defconstant +table-values+ 6 "tables.NV: values per table row (beside the tag).")
 (defconstant +mlp-slice+ 9)
-(defconstant +pack-abs+ (expt 2 20))
-(defparameter *pack-pad* 0.1d0 "proto.PACK_PAD: packing may pad by this fraction of the data.")
 (defparameter *weight-pack-pad* 0.15d0 "llm.W_PACK_PAD, for the weight groups.")
 (defparameter *p-pad* 0.1d0 "llm.P_PAD: the attention probabilities' column padding.")
 
@@ -38,8 +36,6 @@
 (defparameter +nd-f+ '("delta" "rhoD" "recip" "fk"))
 (defparameter +samp-f+ '("Z" "A" "P" "z0" "z1" "z2" "q0" "q1" "q2" "w0" "w1" "w2"
                          "k0" "k1" "k2" "k3" "k4" "d1l" "d1h" "d2l" "d2h"))
-
-(defun nbits (k) (max 0 (integer-length (1- k))))
 
 (defun log2 (x)
   (check-parameter x (lambda (x) (and (integerp x) (plusp x) (= x (expt 2 (1- (integer-length x))))))
@@ -102,28 +98,15 @@ cbv <= CBV-MAX dividing V (llm.block_bits)."
 
 ;;; ------------------------------------------------------------------ packing (proto.Pack)
 
-(defun pack (k c shape cmax pad)
-  "Pack K = Kin Kout blocks of 2^c into Kin G columns of 2^c2: the widest columns whose zero padding
-stays within PAD of the data or within 2^20 entries.  Returns K2, c2 and the blocks per column."
-  (destructuring-bind (kin kout) (or shape (list 1 k))
-    (let ((lb (- (min cmax (+ c (nbits kout))) c)))
-      (loop while (plusp lb)
-            do (let ((npad (ash (* (- (ash (ceiling kout (expt 2 lb)) lb) kout) kin) c)))
-                 ;; the same double-float arithmetic as Python's, compared exactly
-                 (when (or (<= npad (* (* (* kout kin) pad) (expt 2 c))) (<= npad +pack-abs+))
-                   (return))
-                 (decf lb)))
-      (values (* kin (ceiling kout (expt 2 lb))) (+ c lb) (expt 2 lb)))))
-
 (defun packed-items (items cmax pad)
   "A group's items as the commitment declares them (proto.Ctx.group): (name K c), packed where a
 tensor has many small blocks.  An item's optional fourth element is its block shape (Kin Kout),
 or :NO-PACK."
   (loop for (name k c shape) in items
-        collect (if (and (> k 1) (< c cmax) (not (eq shape :no-pack)))
-                    (multiple-value-bind (k2 c2 bpc) (pack k c shape cmax pad)
-                      (if (> bpc 1) (list name k2 c2) (list name k c)))
-                    (list name k c))))
+        collect (let ((pack (and (> k 1) (< c cmax) (not (eq shape :no-pack)) (make-pack k c shape cmax pad))))
+                  (if (and pack (> (pack-bpc pack) 1))
+                      (list name (pack-k2 pack) (pack-c2 pack))
+                      (list name k c)))))
 
 ;;; ------------------------------------------------------------------ the layout (Proto.declare)
 
