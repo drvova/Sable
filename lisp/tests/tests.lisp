@@ -334,3 +334,29 @@
         (assert (equalp (proof base) (proof lifted)))
         (assert (ext= (sable.sumcheck:hypercube-sum statement n base d :eq eq)
                       (sable.sumcheck:hypercube-sum statement n lifted d :eq eq)))))))
+
+(defun test-sumcheck-kernels-match-generic ()
+  ;; the compiled round kernels (base and extension) give the same proofs as the generic loop
+  (let ((d 4) (n 3))
+    (dolist (case '(((* t0 t1 t2) nil nil)
+                    ((+ (* t0 t1 t2) (* 7 t1) -1) t nil)
+                    ((- (* alpha (expt t0 2) t1) t1) nil ((alpha 5 6 7 8)))
+                    (t0 t nil)))
+      (destructuring-bind (statement base constants) case
+        (let* ((state (sb-ext:seed-random-state 11))
+               (constants (loop for (v . c) in constants collect (cons v (coerce-ext c))))
+               (tables (loop for v in (set-difference (form-variables statement) (mapcar #'car constants))
+                             collect (cons v (coerce (loop repeat (expt 2 n)
+                                                           collect (if base
+                                                                       (random +p+ state)
+                                                                       (coerce-ext (loop repeat d collect (random +p+ state)))))
+                                                     'vector))))
+               (eq (loop repeat n collect (coerce-ext (loop repeat d collect (random +p+ state))))))
+          (flet ((proof ()
+                   (let ((tr (make-transcript "kernel" d)))
+                     (multiple-value-bind (rho finals)
+                         (sable.sumcheck:prove tr n statement tables :eq eq :constants constants)
+                       (list (lists rho) finals (sable.proofio:encode-proof (transcript-messages tr)))))))
+            (assert (equalp (proof) (let ((sable.sumcheck:*kernel-size-limit* 0)) (proof))))))))
+    ;; and the kernel is code that can be read
+    (assert (eq 'lambda (first (sable.sumcheck:round-kernel-code '(* a b) '(a b) '() 4 2 nil))))))

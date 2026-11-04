@@ -16,7 +16,7 @@
 (defpackage #:sable.sumcheck
   (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.forms #:sable.transcript)
   (:export #:header #:statement-degree #:hypercube-sum #:prove #:verify #:next-claim
-           #:check-final #:demo))
+           #:check-final #:round-kernel-code #:*kernel-size-limit* #:demo))
 
 (in-package #:sable.sumcheck)
 
@@ -162,12 +162,100 @@ values at the round challenges."
 
 ;;; ------------------------------------------------------------------ prover
 
-(defun round-message (f tables constant-values weights points d)
-  "The round polynomial g(X) = sum_i w_i F(line values at X) at X = 0, 2, 3, ..., POINTS, as the
-rows of a field array.  For each pair (lo, hi) of a table, the line values at X = 0, 1, 2, ... are
-lo, hi, hi + s, hi + 2s, ... for the slope s = hi - lo: additions only.  Every buffer is allocated
-once per round."
-  (let* ((xs (cons 0 (loop for x from 2 to points collect x)))
+;;; One round of the prover computes g(X) = sum_i w_i F(line values at X) at X = 0, 2, 3, ...,
+;;; points.  For each pair (lo, hi) of a table, the line values at X = 0, 1, 2, ... are lo, hi,
+;;; hi + s, hi + 2s, ... for the slope s = hi - lo: additions only.  ROUND-KERNEL-CODE writes the
+;;; whole round for one statement as a LAMBDA form, with the statement inlined and the tables and
+;;; points unrolled, every buffer made once per round; GENERIC-ROUND-SUMS is the same loop
+;;; calling the compiled statement, for statements whose kernel would be too large.
+
+(defun evaluation-points (points)
+  "X = 0, 2, 3, ..., POINTS: g(1) follows from the claim."
+  (cons 0 (loop for x from 2 to points collect x)))
+
+(defun round-kernel-code (statement table-names constant-names d points base)
+  "The LAMBDA form of one prover round for STATEMENT: a function of the tables (TABLEs, in the
+order of TABLE-NAMES), the eq weights (a vector of EXTs) and the constants' values (in the order
+of CONSTANT-NAMES), returning g's sums at the EVALUATION-POINTS.  With BASE (all tables in the
+base field, no constants), the line values and the statement are base-field integers, and each
+term costs one base-times-extension product by its weight."
+  (let* ((xs (evaluation-points points))
+         (n-tables (length table-names))
+         (tables (gensym "TABLES")) (weights (gensym "WEIGHTS")) (i (gensym "I")) (w (gensym "W"))
+         (slope (gensym "SLOPE")) (term (gensym "TERM"))
+         (table-vars (loop repeat n-tables collect (gensym "TABLE")))
+         (entries (loop repeat n-tables collect (gensym "ENTRIES")))
+         (slopes (loop repeat n-tables collect (gensym "SLOPE")))
+         ;; the line values of each table at X = 0 .. points
+         (lines (loop repeat n-tables collect (loop repeat (1+ points) collect (gensym "LINE"))))
+         (sums (loop repeat (length xs) collect (gensym "SUM"))))
+    (multiple-value-bind (buffers code)
+        (if base (values '() (arithmetic-form statement)) (in-place-code statement d))
+      (flet ((at (x)
+               "STATEMENT's code with each table variable bound to its line value at X."
+               `(let ,(loop for name in table-names for line in lines collect `(,name ,(nth x line)))
+                  ,code)))
+        `(lambda (,tables ,weights ,@constant-names)
+           (declare (type list ,tables) (type simple-vector ,weights) (optimize speed)
+                    (sb-ext:muffle-conditions sb-ext:compiler-note))
+           (destructuring-bind ,table-vars ,tables
+             (let* (,@(loop for table in table-vars for e in entries
+                            collect `(,e (table-entries ,table)))
+                    ,@(unless base
+                        (loop for line in lines append (loop for v in line collect `(,v (make-ext ,d)))))
+                    ,@(loop for sum in sums collect `(,sum (make-ext ,d)))
+                    (,slope (make-ext ,d))
+                    (,term (make-ext ,d))
+                    ,@buffers)
+               (declare (type ext ,@entries) (ignorable ,@entries ,slope))
+               (dotimes (,i (length ,weights))
+                 (let ((,w (svref ,weights ,i)))
+                   ,(if base
+                        `(let* ,(loop for line in lines for e in entries for s in slopes
+                                      append `((,(first line) (aref ,e (* 2 ,i)))
+                                               (,(second line) (aref ,e (1+ (* 2 ,i))))
+                                               (,s (fsub ,(second line) ,(first line)))
+                                               ,@(loop for (previous next) on (rest line)
+                                                       while next collect `(,next (fadd ,previous ,s)))))
+                           (declare (type fp ,@(loop for line in lines append line) ,@slopes) (ignorable ,@slopes))
+                           ,@(loop for x in xs for sum in sums
+                                   collect `(ext+ ,sum (ext-scale ,w ,(at x) ,term) ,sum)))
+                        `(progn
+                           ,@(loop for line in lines for table in table-vars
+                                   append `((table-entry ,table (* 2 ,i) ,(first line))
+                                            (table-entry ,table (1+ (* 2 ,i)) ,(second line))
+                                            (ext- ,(second line) ,(first line) ,slope)
+                                            ,@(loop for (previous next) on (rest line)
+                                                    while next collect `(ext+ ,previous ,slope ,next))))
+                           ,@(loop for x in xs for sum in sums
+                                   collect `(ext+ ,sum (ext* ,w ,(at x) ,term) ,sum))))))
+               (list ,@sums))))))))
+
+(defparameter *kernel-size-limit* 20000
+  "The largest round kernel, in conses of its code, that ROUND-KERNEL compiles; a larger statement
+uses GENERIC-ROUND-SUMS (compiling a huge straight-line function takes longer than it saves).")
+
+(defun code-size (form)
+  (if (consp form) (+ 1 (code-size (car form)) (code-size (cdr form))) 0))
+
+(defvar *round-kernels* (make-hash-table :test 'equal)
+  "(statement table-names constant-names d points base) -> the compiled kernel, or NIL.")
+
+(defun round-kernel (statement table-names constant-names d points base)
+  "ROUND-KERNEL-CODE compiled, once per statement and shape; NIL if its code would be larger than
+*KERNEL-SIZE-LIMIT*."
+  (let ((key (list statement table-names constant-names d points base *kernel-size-limit*)))
+    (multiple-value-bind (kernel found) (gethash key *round-kernels*)
+      (if found
+          kernel
+          (setf (gethash key *round-kernels*)
+                (let ((code (round-kernel-code statement table-names constant-names d points base)))
+                  (and (<= (code-size code) *kernel-size-limit*)
+                       (compile nil code))))))))
+
+(defun generic-round-sums (f tables constant-values weights points d)
+  "g's sums at the EVALUATION-POINTS, calling the compiled statement F for each pair and point."
+  (let* ((xs (evaluation-points points))
          (lines (loop repeat (length tables)
                       collect (coerce (loop repeat (1+ points) collect (make-ext d)) 'vector)))
          (arguments (loop for x in xs
@@ -187,26 +275,37 @@ once per round."
              (loop for args in arguments
                    for sum in sums
                    do (ext+ sum (ext* w (apply f args) term) sum)))
-    (make-array (list points d)
-                :element-type '(unsigned-byte 32)
-                :initial-contents (mapcar (lambda (sum) (coerce sum 'list)) sums))))
+    sums))
+
+(defun round-message (sums points d)
+  "The round message: the sums as the rows of a field array (POINTS, D)."
+  (make-array (list points d)
+              :element-type '(unsigned-byte 32)
+              :initial-contents (mapcar (lambda (sum) (coerce sum 'list)) sums)))
 
 (defun prove (tr n statement tables &key eq constants (label "sc"))
   "Prove the sumcheck of STATEMENT on the prover transcript TR (a reference prover, on the CPU).
 TABLES: an alist (variable . 2^N base elements or EXTs); base tables stay in the base field until
-the first fold.  Returns the round challenges and the finals, an alist (variable . EXT at the
-challenges) for CHECK-FINAL."
+the first fold.  Each round runs the statement's compiled ROUND-KERNEL.  Returns the round
+challenges and the finals, an alist (variable . EXT at the challenges) for CHECK-FINAL."
   (let* ((d (transcript-degree tr))
-         (degree (statement-degree statement constants))
-         (f (statement-function statement tables constants d))
-         (constant-values (mapcar #'cdr constants))
+         (points (max (statement-degree statement constants) 1))
          (names (mapcar #'car tables))
+         (constant-names (mapcar #'car constants))
+         (constant-values (mapcar #'cdr constants))
          (flat (loop for (nil . values) in tables collect (make-table values d))))
-    (absorb tr (header label n degree))
+    (absorb tr (header label n (statement-degree statement constants)))
     (values (loop for j below n
-                  collect (progn
-                            (send tr (round-message f flat constant-values (weights eq (1+ j) n d)
-                                                    (max degree 1) d))
+                  collect (let* ((weights (weights eq (1+ j) n d))
+                                 (base (and (null constants)
+                                            (every (lambda (table) (= (table-stride table) 1)) flat)))
+                                 (kernel (round-kernel statement names constant-names d points base))
+                                 (sums (if kernel
+                                           (apply kernel flat weights constant-values)
+                                           (generic-round-sums
+                                            (statement-function statement tables constants d)
+                                            flat constant-values weights points d))))
+                            (send tr (round-message sums points d))
                             (let ((r (challenge tr)))
                               (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
                               r)))

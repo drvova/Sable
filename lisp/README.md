@@ -51,15 +51,33 @@ prover, the verifier and the final check:
 
 A table is a vector of 2^n base elements (integers) or extension elements. The prover stores
 tables flat. A base table stays in the base field until its first fold, which then costs D base
-products per entry instead of a full extension product. Each round computes the line values
-at X = 0, 2, 3, ... from the previous one with a single addition, into buffers allocated once per
-round. Against the earlier prover (best of 7 runs, F_p^8):
+products per entry instead of a full extension product.
 
-| Prover run | Before | Now |
-|---|---|---|
-| 3 extension tables, 14 variables | 0.040 s, 50.6 MB allocated | 0.028 s, 10.1 MB |
-| 2 extension tables, 16 variables | 0.092 s, 106 MB | 0.072 s, 23.2 MB |
-| 2 base tables, 16 variables | not supported | 0.060 s, 19.5 MB |
+Each round runs a kernel compiled for the statement. `round-kernel-code` returns it as a `lambda`
+form you can read:
+
+- **Unrolled:** the loop over table pairs has the statement inlined, unrolled over the tables and
+  the evaluation points.
+- **Line values by addition:** the line values at X = 0, 2, 3, ... each come from the previous one
+  with a single addition.
+- **No allocation in the loop:** every intermediate value has a buffer allocated once per round
+  (`in-place-code` in `forms.lisp`).
+- **Base-field first round:** when every table is still in the base field and there are no
+  constants, the statement runs in base-field arithmetic and each term costs one base-times-extension
+  product by its eq weight.
+
+Compiling a kernel takes 8–20 ms, once per statement. A statement whose kernel would exceed
+`*kernel-size-limit*` uses the generic loop instead, and a test checks that both give the same
+proofs.
+
+Best of 7 runs, F_p^8:
+
+| Prover run | Field rewrite (steps 1–2) | Flat tables (step 3) | Round kernels (step 4) |
+|---|---|---|---|
+| 3 extension tables, 14 variables | 0.040 s, 50.6 MB allocated | 0.028 s, 10.1 MB | 0.024 s, 5.4 MB |
+| 3 base tables, 14 variables | not supported | 0.028 s, 8.7 MB | 0.016 s, 4.0 MB |
+| 2 extension tables, 16 variables | 0.092 s, 106 MB | 0.072 s, 23.2 MB | 0.064–0.068 s, 16.9 MB |
+| 2 base tables, 16 variables | not supported | 0.060 s, 19.5 MB | 0.044–0.048 s, 13.2 MB |
 
 The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
 on symbolic coordinates:
@@ -91,12 +109,12 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `util.lisp` | | octet vectors, little-endian integers |
 | `conditions.lisp` | (`ValueError`, `assert`) | the condition hierarchy, `check-parameter` |
 | `field.lisp` | `zk/field.py`, `zk/fe.py` | KoalaBear F_p with branchless addition, the tower (`mul*` as a lazily reduced schoolbook product, `inv*`, `tower-code`), Lagrange interpolation, eq tables, MLE evaluation |
-| `forms.lisp` | `zk/poly.py`, the expressions of `zk/sumcheck.py` | arithmetic forms: `expand`, `normalize`, `form-degree`, `arithmetic-form`, `compile-form`, `evaluate` |
+| `forms.lisp` | `zk/poly.py`, the expressions of `zk/sumcheck.py` | arithmetic forms: `expand`, `normalize`, `form-degree`, `arithmetic-form`, `in-place-code`, `compile-form`, `evaluate` |
 | `blake3.lisp` | `zk/cuda/b3s.h`, `blake3` | the sequential BLAKE3 mode of the transcript, and standard BLAKE3 |
 | `transcript.lisp` | `zk/transcript.py` | the Fiat-Shamir transcript |
 | `proofio.lisp` | `zk/proofio.py` | the proof byte format (`SABLEPF1`) |
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code |
-| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with base tables kept in the base field until their first fold |
+| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`) and base tables kept in the base field until their first fold |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that

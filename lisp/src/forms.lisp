@@ -15,7 +15,7 @@
 (defpackage #:sable.forms
   (:use #:cl #:sable.conditions #:sable.field)
   (:export #:expand #:normalize #:form-degree #:form-variables #:constant-term #:form=
-           #:arithmetic-form #:compile-form #:evaluate))
+           #:arithmetic-form #:in-place-code #:compile-form #:evaluate))
 
 (in-package #:sable.forms)
 
@@ -140,6 +140,50 @@ field's (FADD, EXT* ...), integers its constants; the variables are left free."
                            (t (malformed-form f)))))
                  (t (malformed-form f)))))
       (walk form))))
+
+(defun in-place-code (form degree)
+  "FORM over F_p^DEGREE as code that writes every intermediate value into a buffer of its own, so
+running it allocates nothing.  Returns the bindings that make the buffers (to be evaluated once,
+outside a loop) and the code, whose value is the EXT holding FORM's value (a buffer, or one of
+FORM's variables).  The variables are left free."
+  (let ((buffers '())
+        (steps '()))
+    (labels ((buffer (initial-value)
+               (let ((variable (gensym "B")))
+                 (push (list variable initial-value) buffers)
+                 variable))
+             (emit (operator &rest arguments)
+               (let ((out (buffer `(make-ext ,degree))))
+                 (push `(,operator ,@arguments ,out) steps)
+                 out))
+             (chain (operator arguments empty)
+               (if arguments
+                   (reduce (lambda (a b) (emit operator a b)) (mapcar #'walk arguments))
+                   (buffer empty)))
+             (walk (f)
+               (typecase f
+                 (integer (buffer `(base->ext ,(modp f) ,degree)))
+                 ((and symbol (not null)) f)
+                 (cons (destructuring-bind (operator &rest arguments) f
+                         (case operator
+                           (+ (chain 'ext+ arguments `(make-ext ,degree)))
+                           (* (chain 'ext* arguments `(ext-one ,degree)))
+                           (- (if (rest arguments)
+                                  (chain 'ext- arguments `(make-ext ,degree))
+                                  (emit 'ext-neg (walk (first arguments)))))
+                           (expt (destructuring-bind (base k) arguments
+                                   (unless (typep k '(integer 0)) (malformed-form f))
+                                   (let ((b (walk base)))
+                                     (if (zerop k)
+                                         (buffer `(ext-one ,degree))
+                                         (let ((acc b))
+                                           (loop repeat (1- k)
+                                                 do (setf acc (emit 'ext* acc b)))
+                                           acc)))))
+                           (t (malformed-form f)))))
+                 (t (malformed-form f)))))
+      (let ((result (walk form)))
+        (values (reverse buffers) `(progn ,@(reverse steps) ,result))))))
 
 (defvar *compiled-forms* (make-hash-table :test 'equal)
   "(form variables degree) -> the compiled function.")
