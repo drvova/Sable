@@ -904,13 +904,15 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
     (export-domain-cases "7a53788916a303f668251d4e05b22085efcb4d57813bc58a0f93e7f214cbcf12")
     (export-pcs-cases "6ade2c3e6acad8ce06eea085b01b9534d625ff4476f7d970a2b3376949378d37")
     (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
-    (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce"))
+    (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce")
+    (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
 rejected 287 forgeries, and zk/llm.py computed the same 18 layouts, 9 statements and seeds,
 10 statement checks and C_W; and zk/proto.py's Ctx replayed the context scenario, computed the
-same values and rejected its 95 forgeries.  The files differ from those only in the proof magic
+same values and rejected its 95 forgeries; Sable's logup.table_side, at 2^9 rows, replayed the
+table-side scenario with the same claims and chunk sums and rejected its 172 forgeries.  The files differ from those only in the proof magic
 (EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
@@ -1126,3 +1128,183 @@ Sable's Ctx (zk/proto.py) replayed exactly this; TEST-FROZEN-CASES pins it."
                             collect (format nil "[\"~(~A~)\", ~A, ~A]" name (json-point point) (json-vector value))))
               (format s "\"chunk_sum\": ~A}~%" (json-ext (noted :chunk-sum)))))))))
   path)
+
+;;; ------------------------------------------------------------------ the table side of LogUp
+
+(defparameter *small-log-rows* 9)
+
+(defun small-layout ()
+  "Range tags 0 .. 6 and a 255-row segment for tag 25 (STAR8): 382 rows of a 2^9-row table."
+  (let ((offset 0))
+    (append (loop for k from 0 to 6 collect (prog1 (list k offset 0 (expt 2 k)) (incf offset (expt 2 k))))
+            (list (list 25 offset 0 255)))))
+
+(defun small-table ()
+  (let ((columns (loop repeat 7 collect (make-array (expt 2 *small-log-rows*) :initial-element 0))))
+    (loop for (tag base nil size) in (small-layout)
+          do (dotimes (i size)
+               (setf (aref (first columns) (+ base i)) tag
+                     (aref (second columns) (+ base i)) i)))
+    columns))
+
+(defun range-domain (state)
+  (let ((n 3) (k 2))
+    (flet ((col (bound) (coerce (loop repeat (* k (expt 2 n)) collect (random bound state)) 'vector)))
+      (exacta.domain:make-domain
+       :name "toy.range" :n n :blocks k
+       :columns `((x :data ,(col 64)) (y :data ,(col 255)) (z :data ,(col 8)))
+       :lookups '((:tag 6 :values (x)) (:tag 25 :values (y)) (:tag 3 :values (z)))))))
+
+(defun table-scenario (context domain)
+  "The table's commitment, the commit pass's counting, the domain, the table side and the openings.
+Returns the domain's claims, the chunk sums (verifier) and the claims left on tab<j> and mult<i>."
+  (let* ((tr (exacta.proto:context-tr context))
+         (prover (exacta.proto:prover-p context))
+         (exacta.tables:*log-rows* *small-log-rows*)
+         (columns (and prover (small-table)))
+         (chunks (and prover (exacta.tables:make-chunks :limit 32 :log-rows *small-log-rows*)))
+         (out '()))
+    (exacta.proto:declare-group context "tab" (loop for j below 7 collect (list (format nil "tab~D" j) 1 *small-log-rows*)))
+    (exacta.proto:commit-group context "tab" (and prover (loop for c in columns for j from 0 collect (cons (format nil "tab~D" j) c))))
+    (when prover (exacta.tables:count-lookups chunks domain :layout (small-layout)))
+    (let* ((assign (exacta.proto:parse-assign
+                    (send-bytes tr (and prover (exacta.proto:assign-octets (exacta.tables:chunks-assignments chunks))))))
+           (nchunks (1+ (loop for c being the hash-values of assign maximize c))))
+      (setf (exacta.proto:context-assign context) assign)
+      (dotimes (i nchunks)
+        (let ((name (format nil "mult~D" i)))
+          (exacta.proto:declare-group context name (list (list name 1 *small-log-rows*)))
+          (exacta.proto:commit-group context name (and prover (list (cons name (exacta.tables:chunk-multiplicities chunks i)))))))
+      (exacta.proto:draw-lookup-challenges context)
+      (let ((claims '()))
+        (exacta.proto:run-domain context domain
+                                 (loop for name in '(x y z)
+                                       collect (let ((name name)) (cons name (lambda (p v) (push (list name p v) claims))))))
+        (push (cons :domain (reverse claims)) out))
+      (let ((sums (and (not prover)
+                       (loop for i below nchunks
+                             collect (gethash i (exacta.proto::context-chunk-sums context) (make-ext 4))))))
+        (push (cons :sums sums) out)
+        (exacta.tables:table-side context :columns columns :chunks chunks :sums sums))
+      (push (cons :pending (loop for name in (append (loop for j below 7 collect (format nil "tab~D" j))
+                                                     (loop for i below nchunks collect (format nil "mult~D" i)))
+                                 collect (cons name (exacta.proto:pending-claims context name))))
+            out)
+      (exacta.proto:open-group context "tab")
+      (dotimes (i nchunks) (exacta.proto:open-group context (format nil "mult~D" i)))
+      (exacta.pcs:pcs-finish (exacta.proto:context-pcs context))
+      (unless prover (exacta.proto:check-lookup-sets context))
+      (reverse out))))
+
+(defun table-run (domain &optional messages)
+  (let* ((tr (if messages (make-transcript "table-test" 4 :messages messages) (make-transcript "table-test" 4)))
+         (context (exacta.proto:make-context (if messages :verify :prove) tr :cmax 9 :queries 6 :grind 4)))
+    (values (table-scenario context domain) tr)))
+
+(defun test-table-side ()
+  (let ((domain (range-domain (sb-ext:seed-random-state 71))))
+    (multiple-value-bind (proved tr) (table-run domain)
+      (declare (ignore proved))
+      (let ((messages (transcript-messages tr)))
+        (multiple-value-bind (out vtr) (table-run domain messages)
+          (assert (transcript-finished-p vtr))
+          (assert (= (length (cdr (assoc :sums out))) 2)))
+        (let ((accepted '()) (state (sb-ext:seed-random-state 9)))
+          (loop for i below (length messages)
+                for m = (aref messages i)
+                when (and (typep m 'field-array) (plusp (array-total-size m)))
+                  do (let ((bad (copy-seq messages))
+                           (m2 (make-array (array-dimensions m) :element-type (array-element-type m)))
+                           (j (random (array-total-size m) state)))
+                       (dotimes (x (array-total-size m)) (setf (row-major-aref m2 x) (row-major-aref m x)))
+                       (setf (row-major-aref m2 j) (mod (1+ (row-major-aref m j)) +p+))
+                       (setf (aref bad i) m2)
+                       (unless (signalled 'exacta-error (lambda () (table-run domain bad)))
+                         (push i accepted))))
+          (assert (null accepted) () "forgeries accepted at messages ~A" accepted))))))
+
+(defun export-table-cases (path)
+  "Write the table-side scenario's proof, its domain and what Exacta's verifier computed, as JSON.
+Sable's Ctx and logup.table_side (at 2^9 rows) replayed exactly this; TEST-FROZEN-CASES pins it."
+  (let ((domain (range-domain (sb-ext:seed-random-state 71))))
+    (multiple-value-bind (proved tr) (table-run domain)
+      (declare (ignore proved))
+      (let* ((messages (transcript-messages tr))
+             (out (table-run domain messages)))
+        (with-open-file (s path :direction :output :if-exists :supersede)
+          (format s "{\"proof\": \"~(~{~2,'0X~}~)\", \"log_rows\": ~D,~%"
+                  (coerce (exacta.proofio:encode-proof messages) 'list) *small-log-rows*)
+          (format s "\"domain\": {\"name\": \"~A\", \"n\": ~D, \"K\": ~D, \"lookups\": [~{~A~^,~}]},~%"
+                  (exacta.domain:domain-name domain) (exacta.domain:domain-n domain) (exacta.domain:domain-blocks domain)
+                  (loop for lookup in (exacta.domain:domain-lookups domain)
+                        collect (format nil "{\"tag\": ~A, \"values\": [~{~A~^,~}]}"
+                                        (json-form (getf lookup :tag)) (mapcar #'json-form (getf lookup :values)))))
+          (format s "\"claims\": [~{~A~^,~}],~%"
+                  (loop for (name point value) in (cdr (assoc :domain out))
+                        collect (format nil "[\"~(~A~)\", ~A, ~A]" name (json-point point) (json-vector value))))
+          (format s "\"sums\": ~A,~%" (json-vector (cdr (assoc :sums out))))
+          (format s "\"pending\": {~{~A~^,~}}}~%"
+                  (loop for (name . claims) in (cdr (assoc :pending out))
+                        collect (format nil "\"~A\": [~{~A~^,~}]" name
+                                        (loop for (point values) in claims
+                                              collect (format nil "[~A, ~A]" (json-point point)
+                                                              (json-vector (mapcar #'cdr values)))))))))))
+  path)
+
+;;; ------------------------------------------------------------------ public MLEs
+
+(defun test-public-mles ()
+  "Each closed form equals the MLE of its whole vector at random points."
+  (let ((state (sb-ext:seed-random-state 81)))
+    (flet ((point (n) (loop repeat n collect (coerce-ext (loop repeat 4 collect (random +p+ state)))))
+           (mle (f n point) (mle-eval (coerce (loop for i below (expt 2 n) collect (funcall f i)) 'vector) point 4)))
+      (dotimes (trial 3)
+        (let ((p (point 6)))
+          (dolist (s '(0 2 5))
+            (assert (ext= (exacta.public:iota p s) (mle (lambda (i) (ash (ash i (- s)) s)) 6 p))))
+          (assert (ext= (exacta.public:le-low-high p 3)
+                        (mle (lambda (i) (if (<= (ldb (byte 3 0) i) (ldb (byte 3 3) i)) 1 0)) 6 p)))
+          (dolist (y '(-3 0 1 17 63 64 100))
+            (assert (ext= (exacta.public:lt-const p y) (mle (lambda (v) (if (< v y) 1 0)) 6 p)))
+            (assert (ext= (exacta.public:eq-const p y) (mle (lambda (v) (if (= v y) 1 0)) 6 p)))))
+        ;; vocabulary indicators: R = 4 rows, V = 40 (Kv = 5 blocks of 2^3), targets in and beyond V
+        (let* ((cb 3) (kv 5) (ys (list 0 13 39 47)) (p (point (+ cb 2))))
+          (dolist (kind '(:lt :eq))
+            (let ((closed (exacta.public:vocab-indicator p ys cb kv kind)))
+              (dotimes (k kv)
+                (assert (ext= (aref closed k)
+                              (mle (lambda (i)
+                                     (let ((v (+ (* k (expt 2 cb)) (ldb (byte cb 0) i)))
+                                           (y (nth (ash i (- cb)) ys)))
+                                       (if (if (eq kind :lt) (< v y) (= v y)) 1 0)))
+                                   (+ cb 2) p)))))))))))
+
+;;; ------------------------------------------------------------------ the table's values
+
+(defun fingerprint (values)
+  "Two polynomial hashes mod p of VALUES (integers, taken mod p): a fast regression pin."
+  (let ((a 0) (b 0) (r1 1234567) (r2 7654321))
+    (declare (type (integer 0 #.+p+) a b))
+    (loop for v across values
+          do (let ((v (mod v +p+)))
+               (setf a (mod (+ (* a r1) v) +p+)
+                     b (mod (+ (* b r2) v) +p+))))
+    (list a b)))
+
+(defun table-value-fingerprints ()
+  "Fingerprints of the tiny model's value tables (E = -8, dh = 128, eG = -11, eA = -12, sampling at
+temperature index 3, the router's, RoPE for theta 10^6 and S = 256).  These values were checked
+equal to Sable's (model.exp_table, silu_values, samp_table, router_table, rope_tables), and the
+whole 2^26-row table built from them to tables.build_table's, column by column."
+  (multiple-value-bind (cos sin) (exacta.tables:rope-tables 1000000 128 256)
+    (list (fingerprint (exacta.tables:exp-values -8 128))
+          (fingerprint (exacta.tables:silu-values -11 -12))
+          (fingerprint (exacta.tables:samp-values 3))
+          (fingerprint (exacta.tables:router-values))
+          (fingerprint (make-array (array-total-size cos) :displaced-to cos))
+          (fingerprint (make-array (array-total-size sin) :displaced-to sin)))))
+
+(defun test-table-values ()
+  (assert (equal (table-value-fingerprints)
+                 '((1397366438 838731675) (1377669541 1092948269) (46828831 101124040)
+                   (1818342257 1780444900) (741164168 1772295875) (799026709 234658675)))))

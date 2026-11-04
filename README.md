@@ -46,7 +46,9 @@ that way without Python:
 | Polynomial commitment (BaseFold) | done | `zk/gpcs.py`'s verifier: 3 scenarios, 287 forgeries |
 | Statement, policy, sampling seed, C_W, commitment layout | done | `zk/llm.py`: 18 layouts, 9 statements, 10 checks |
 | Protocol context (claims, packing, domains and sumchecks in a step, LogUp sets) | done (stage 8a) | `zk/proto.py`'s `Ctx`: one scenario, 95 forgeries |
-| Per-layer steps of the model's proof | in progress (stages 8b–8e) | |
+| The lookup table: its 2^26 rows, the model's value tables, multiplicities, the LogUp table side; public MLEs | done (stage 8b) | `zk/tables.py` and `zk/model.py`: every column and value table equal; `logup.table_side`: one scenario, 172 forgeries |
+| Commitments and GKR at the table's size (2^26 rows) | not yet (stage 8b2) | |
+| Per-layer steps of the model's proof | not yet (stages 8c–8e) | |
 | Prover for whole models | not yet | |
 
 So Exacta cannot yet verify a whole proof of a model. Every protocol that proof is made of is
@@ -197,6 +199,9 @@ The second column names the Sable code that each file reimplements.
 | `pcs.lisp` | `zk/gpcs.py` | the polynomial commitment: units and size classes, merged mixed-height Merkle trees with caps, the per-class point reductions, segments, the cross-unit sumcheck, BaseFold with oracles, grinding and the query checks; a CPU reference prover |
 | `sha256.lisp` | `hashlib.sha256` | SHA-256 (FIPS 180-4), for the statement's digests |
 | `proto.lisp` | `zk/proto.py` (`Ctx`, `Pack`), `logup.parse_assign` | the protocol context the steps share, in `:commit`, `:prove` and `:verify` mode: tensors and their packing, block, point and weighted claims, group openings, `run-domain` with the LogUp root sums and `check-lookup-sets`, `run-sumcheck` with zk/'s header-degree rules (`piece`, `sumcheck-degree`), virtual claims |
+| `exact.lisp` | `round_exact` in `zk/model.py`, mpmath | correctly rounded values: fixed-point exp, ln, sin, cos and sqrt at 320 bits, and Sable's rule for when to use them |
+| `tables.lisp` | `zk/tables.py`, `zk/logup.py`, the table functions of `zk/model.py` | the global lookup table: tags, layout and rows, the model's value tables (`exp-values`, `silu-values`, `samp-values`, `router-values`, `rope-tables`), `build-table`; chunks and `count-lookups`; `table-side`, the table's half of LogUp |
+| `public.lisp` | `zk/mlepub.py` | closed-form MLEs of public vectors: `iota`, `le-low-high`, `lt-const`, `eq-const`, `vocab-indicator` |
 | `llm.lisp` | the outer layer of `zk/llm.py`, `zk/proto.py` | the transformer protocol's public side: `make-cfg`, `make-shape`, `column-block-bits`, the commitment layout (`commitment-layout`: groups, packing, merge sets, segments, weight groups; `declare-units`), the policy and its encoding, `check-statement`, `statement`, `sampling-seed`, `weights-digest` (C_W) |
 | `toplevel.lisp` | | the executable: evaluates forms in `exacta-user`; `(help)` |
 
@@ -347,13 +352,37 @@ weighted blocks, both degree rules, and a domain with a layer parameter, a table
 dynamic pair. Sable's `Ctx` replays Exacta's proof, consumes all 103 messages, computes the same
 values and rejects all 95 forgeries; so does Exacta's verifier (`test-proto-roundtrip`).
 
+### The lookup table
+
+Every lookup into a fixed table goes to one global table of 2^26 rows (`tables.lisp`). Each row
+is a tuple (tag, v0, …, v5), and each tag owns a segment of rows: ranges, shift regimes, powers of
+two, reciprocals, square roots, and the model's value tables. The value tables hold exp for
+attention, SiLU, the sampling temperature's exp, and the MoE router's exp. RoPE's cos and sin are
+a second fixed unit.
+
+The value tables are correctly rounded values of transcendental functions. Like Sable, Exacta
+computes them in double floats and recomputes exactly any entry within 10⁻⁴ of a tie, using
+fixed-point arithmetic at 320 bits (`exact.lisp`) where Sable used mpmath. The result is
+independent of the platform. For a tiny model, every value table and all seven columns of the
+2^26-row table are byte for byte Sable's (`test-table-values` pins the value tables). Building
+the table takes about 4 s.
+
+The table side of LogUp (`table-side`) proves that the lookups assigned to each chunk sum to that
+chunk's multiplicities over the table. It uses one GKR over the table's rows, a leaf sumcheck,
+claims on the table's columns and claims on the multiplicities. The scenario at 2^9 rows counts a
+domain's lookups into two chunks; Sable's `logup.table_side` accepts the proof with the same
+claims and sums and rejects all 172 forgeries (`test-table-side`, pinned in
+`test-frozen-cases`).
+
 ### Not done yet
 
 - **The per-layer steps of the model's proof (Sable's `Proto.run`):** the F_O model's domains of
   each unit, their claims and how they reach the commitment. Everything they are built from is
   done: the sumcheck, LogUp-GKR, domains, the commitment, the outer layer and the protocol
-  context. The remaining stages are 8b (the LogUp table side and public MLEs), 8c (the F_O
-  model's data and per-layer witness), 8d (each unit's steps) and 8e (whole proofs, then MoE). `read-proof-file`
+  context, the lookup table and its side of LogUp. The remaining stages are 8b2 (commitments and
+  GKR fast enough for the table's 2^26 rows: today a commitment costs about 6 µs and 2 KB of
+  allocation per element, so the table alone would take most of an hour), 8c (the F_O model's
+  data and per-layer witness), 8d (each unit's steps) and 8e (whole proofs, then MoE). `read-proof-file`
   parses a real Sable proof, but cannot verify it yet. The reference for this work is Sable's code
   at commit 81807ef. That commit also has `lisp/tests/gpu-trace.py`, which runs Sable's GPU
   prover on a tiny model and records every sub-protocol call of its host verifier, so each step

@@ -32,7 +32,7 @@
 (in-package #:exacta.proto)
 
 (defconstant +lookup-limit+ (expt 2 30) "logup.LIMIT: the most lookups in one chunk.")
-(defconstant +beta-count+ 6 "gkr.NBETA: the tuple coefficients drawn for every domain.")
+(defconstant +beta-count+ 8 "gkr.NBETA: the tuple coefficients drawn for every domain.")
 
 ;;; ------------------------------------------------------------------ packing (proto.Pack)
 
