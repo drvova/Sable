@@ -153,6 +153,7 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code |
 | `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`), split eq weights, and the first rounds of base tables answered from small-value accumulators (`small-value-code`) |
 | `gkr.lisp` | `zk/gkr.py`, `vc_gkr_upper` in `zk/cuda/vcore.cpp` | batched LogUp-GKR fractional sums: `verify-upper`, a CPU reference prover `prove-upper`, the layer statement as a form |
+| `domain.lisp` | `zk/domain.py` | a domain (columns, zerocheck constraints, lookups) as data; its leaf-layer and zerocheck statement as one form; `verify-domain` and a CPU reference prover `prove-domain` |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
@@ -186,11 +187,44 @@ non-powers of two), 1 to 3 lookups, and F_p^4 and F_p^8. It then checks each wit
 The Lisp tests add LogUp's meaning: each root fraction equals the sum of its leaf fractions, and
 the claims equal the multilinear extension of the leaves' parent layer.
 
+**Domains.** A domain is K blocks of 2^n elements with base-field columns, zerocheck constraints
+and lookups, written as data. The constraints and the lookups' tags, values and numerators are
+forms over the column names:
+
+```lisp
+(make-domain :name "12.toy" :n 3 :blocks 3
+             :columns '((a) (b) (c) (m :kind :row :c 1 :shared t) (kb :kind :row :c 3))
+             :constraints '((* a (- a 1)) (- c (* a b)))
+             :lookups '((:tag 5 :values (a b)) (:tag 9 :values (kb) :num m)))
+```
+
+`verify-domain` replays `domain.verify`:
+
+1. LogUp-GKR over the lookups down to layer n−1.
+2. One sumcheck over the column halves, whose statement (`domain-statement`) is a single form: the
+   leaf layer of every lookup's tree, plus the zerocheck of every constraint.
+3. The column claims at the final point, with the block index bound inside the protocol when the
+   domain is merged.
+
+The header's degree follows zk/'s per-round rule (`domain-degree`): a `:row` or `:col` table only
+counts in the rounds where it varies.
+
+**Cross-check against Python's verifier.** `make crosscheck PYTHON=...`, given a Python with
+PyTorch (the CPU build is enough), checks 16 domain proofs made by `prove-domain` with Python's
+own `domain.verify`. It runs in `llm.verify(cpu=True)`'s host mode, on Python's factored form of
+the leaf statement and the C++ verifier core. The proofs cover merged and unmerged blocks, 1 to 5
+blocks, every column kind, no lookups or no constraints, and F_p^4 and F_p^8.
+
+- Python accepts each proof, consumes every message, and computes the same claims and roots.
+- It rejects every changed value except changes to the final of a column that no constraint or
+  lookup uses. Such a final only becomes that column's claim, which the commitment's opening
+  checks, and the Lisp verifier treats it the same way.
+
 Not ported yet:
 
-- **The rest of the verifier:** the leaf layer and constraint checks of a domain (`domain.verify`),
-  the BaseFold opening and Merkle query checks of the polynomial commitment (`gpcs.py`), and the
-  transformer protocol (`llm.verify`). `read-proof-file` parses a real proof, but a real proof
+- **The rest of the verifier:** the BaseFold opening and Merkle query checks of the polynomial
+  commitment (`gpcs.py`), and the transformer protocol (`llm.verify`): its statement, policy,
+  weight commitment and the domains of each layer. `read-proof-file` parses a real proof, but a real proof
   cannot be verified yet. Producing one needs the GPU prover, so end-to-end checks need a machine
   with an NVIDIA GPU.
 - **The GPU prover:** the kernels generated for NVRTC, CuPy and PyTorch. It is not a candidate for
@@ -203,7 +237,8 @@ make            # ./sable, a standalone executable (runs the tests first; HEAP=8
 make core       # sable.core, for `sbcl --core sable.core' (starts in SABLE-USER)
 make test       # compile and run the tests (asdf:test-system "sable")
 make vectors    # regenerate tests/vectors.sexp from the Python code (numpy, blake3, g++)
-make crosscheck # check the Lisp GKR proofs with the original C++ verifier (numpy, g++)
+make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.cpp (numpy, g++),
+                #   domains with zk/domain.py (also PyTorch: make crosscheck PYTHON=...)
 ```
 
 ## Use

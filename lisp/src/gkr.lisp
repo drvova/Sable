@@ -15,7 +15,8 @@
 (defpackage #:sable.gkr
   (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.forms #:sable.transcript
         #:sable.sumcheck)
-  (:export #:layer-statement #:fraction-trees #:prove-upper #:verify-upper #:block-bits))
+  (:export #:layer-statement #:fraction-trees #:prove-upper #:verify-upper #:block-bits
+           #:layer-claim #:block-weights))
 
 (in-package #:sable.gkr)
 

@@ -471,3 +471,144 @@ tests/check-gkr-vcore.py, which checks them with zk/cuda/vcore.cpp's vc_gkr_uppe
                                (ints ri) (ints rb) (ints cp) (ints cq) more))))))
       (format out "]~%"))
     path))
+
+;;; ------------------------------------------------------------------ domains
+
+(defun toy-domain (&key (n 3) (k 3) merge (lookups t) (constraints t) (state (sb-ext:seed-random-state 5)) break)
+  "A domain with every kind of column: bits A, products C = A B, a :ROW 1 shared column M, a :COL n
+shared mask S, a per-block constant KB (:ROW n), a :COL 2 column W.  With BREAK, C is wrong at one
+point, so a constraint fails."
+  (let* ((size (expt 2 n))
+         (a (coerce (loop repeat (* k size) collect (random 2 state)) 'vector))
+         (b (coerce (loop repeat (* k size) collect (random +p+ state)) 'vector))
+         (c (map 'vector (lambda (x y) (fmul x y)) a b))
+         (m (coerce (loop repeat (expt 2 (1- n)) collect (random +p+ state)) 'vector))
+         (s (coerce (loop repeat size collect (random 2 state)) 'vector))
+         (kb (coerce (loop repeat k collect (random +p+ state)) 'vector))
+         (w (coerce (loop repeat (* k 4) collect (random +p+ state)) 'vector)))
+    (when break (setf (aref c 1) (fadd (aref c 1) 1)))
+    (sable.domain:make-domain
+     :name (format nil "12.toy~:[~;-merged~]" merge) :n n :blocks k :merge merge
+     :columns `((a :data ,a) (b :data ,b) (c :data ,c) (m :kind :row :c 1 :shared t :data ,m)
+                (s :kind :col :c ,n :shared t :data ,s) (kb :kind :row :c ,n :data ,kb)
+                (w :kind :col :c 2 :data ,w))
+     :constraints (and constraints '((* a (- a 1)) (- c (* a b)) (* s (- s 1) m)))
+     :lookups (and lookups '((:tag 5 :values (a b))
+                             (:tag 7 :values (c m w) :num (+ s 2))
+                             (:tag 9 :values (kb)))))))
+
+(defun lookup-challenges (d state)
+  (values (coerce-ext (loop repeat d collect (random +p+ state)))
+          (loop repeat 8 collect (coerce-ext (loop repeat d collect (random +p+ state))))))
+
+(defun domain-proof (domain d z betas)
+  (let ((tr (make-transcript "dom-test" d)))
+    (values (transcript-messages tr) (sable.domain:prove-domain tr domain z betas))))
+
+(defun domain-mle (column domain point b d)
+  "The MLE of a :FULL column's block B at POINT (its N coordinates)."
+  (let ((size (expt 2 (sable.domain:domain-n domain))))
+    (mle-eval (subseq (sable.domain:column-data column) (* b size) (* (1+ b) size)) point d)))
+
+(defun test-domain-roundtrip ()
+  (dolist (case '((:n 3 :k 3) (:n 2 :k 1) (:n 3 :k 3 :merge t) (:n 4 :k 4 :merge t) (:n 3 :k 2 :lookups nil)
+                  (:n 3 :k 2 :constraints nil) (:n 2 :k 1 :merge t)))
+    (dolist (d '(4 8))
+      (let* ((state (sb-ext:seed-random-state (+ d (getf case :n) (getf case :k))))
+             (domain (apply #'toy-domain :state state case)))
+        (multiple-value-bind (z betas) (lookup-challenges d state)
+          (multiple-value-bind (messages proved) (domain-proof domain d z betas)
+            (let ((tr (make-transcript "dom-test" d :messages messages)))
+              (let ((claims (sable.domain:verify-domain tr domain z betas)))
+                (assert (transcript-finished-p tr))
+                (assert (equalp claims proved) () "~S: verifier and prover claims differ" case)
+                ;; a full column's claim is its MLE at the claimed point
+                (loop for (name point value) in claims
+                      for column = (find name (sable.domain:domain-columns domain) :key #'sable.domain:column-name)
+                      when (eq (sable.domain:column-kind column) :full)
+                        do (let ((n (sable.domain:domain-n domain)) (k (sable.domain:domain-blocks domain)))
+                             (if (sable.domain:domain-merge domain)
+                                 (let ((weights (if (> k 1) (sable.field:eq-table (nthcdr n point) d) (vector (ext-one d)))))
+                                   (assert (ext= value (reduce #'ext+ (loop for b below k
+                                                                            collect (ext* (aref weights b)
+                                                                                          (domain-mle column domain (subseq point 0 n) b d)))))))
+                                 (dotimes (b k)
+                                   (assert (ext= (aref value b) (domain-mle column domain point b d)))))))))))))))
+
+(defun test-domain-rejects ()
+  (let ((d 4))
+    (dolist (merge '(nil t))
+      ;; a constraint that does not hold
+      (let ((state (sb-ext:seed-random-state 3)))
+        (let ((domain (toy-domain :merge merge :state state :break t)))
+          (multiple-value-bind (z betas) (lookup-challenges d state)
+            (assert (signalled 'verification-failure
+                               (lambda () (sable.domain:verify-domain
+                                           (make-transcript "dom-test" d :messages (domain-proof domain d z betas))
+                                           domain z betas)))))))
+      ;; any changed value
+      (let* ((state (sb-ext:seed-random-state 4))
+             (domain (toy-domain :merge merge :state state)))
+        (multiple-value-bind (z betas) (lookup-challenges d state)
+          (let ((messages (domain-proof domain d z betas)))
+            (loop for i below (length messages)
+                  for m = (aref messages i)
+                  do (let ((forged (copy-seq messages))
+                           (changed (make-array (array-dimensions m) :element-type '(unsigned-byte 32))))
+                       (dotimes (j (array-total-size m)) (setf (row-major-aref changed j) (row-major-aref m j)))
+                       (setf (row-major-aref changed 0) (fadd (row-major-aref changed 0) 1)
+                             (aref forged i) changed)
+                       (assert (signalled 'verification-failure
+                                          (lambda () (sable.domain:verify-domain
+                                                      (make-transcript "dom-test" d :messages forged) domain z betas)))
+                               () "merge ~A, message ~D: forgery accepted" merge i)))))))))
+
+(defun json-form (form)
+  "A form as JSON: a symbol as its name, a list as an array (operator first)."
+  (etypecase form
+    (null "[]")
+    (integer (format nil "~D" form))
+    (symbol (format nil "\"~(~A~)\"" (symbol-name form)))
+    (list (format nil "[~{~A~^,~}]" (mapcar #'json-form form)))))
+
+(defun json-ints (seq) (format nil "[~{~D~^,~}]" (coerce seq 'list)))
+(defun json-exts (exts) (format nil "[~{~A~^,~}]" (map 'list #'json-ints exts)))
+
+(defun export-domain-cases (path)
+  "Write domain proofs made by PROVE-DOMAIN, with the claims and roots VERIFY-DOMAIN computes, as
+JSON for tests/check-domain-python.py, which checks them with zk/domain.py's verify."
+  (with-open-file (out path :direction :output :if-exists :supersede)
+    (format out "[~%")
+    (loop for (case . more) on '((:n 3 :k 3) (:n 2 :k 1) (:n 3 :k 3 :merge t) (:n 4 :k 4 :merge t)
+                                 (:n 3 :k 2 :lookups nil) (:n 3 :k 2 :constraints nil) (:n 4 :k 5 :merge t)
+                                 (:n 3 :k 5))
+          do (dolist (d '(4 8))
+               (let* ((state (sb-ext:seed-random-state (+ d (* 3 (getf case :n)) (getf case :k))))
+                      (domain (apply #'toy-domain :state state case)))
+                 (multiple-value-bind (z betas) (lookup-challenges d state)
+                   (let ((messages (domain-proof domain d z betas)))
+                     (multiple-value-bind (claims roots)
+                         (sable.domain:verify-domain (make-transcript "dom-test" d :messages messages) domain z betas)
+                       (format out "{\"name\": \"~A\", \"n\": ~D, \"K\": ~D, \"merge\": ~:[false~;true~], \"D\": ~D, ~
+                                    \"label\": \"dom-test\", \"columns\": [~{~A~^,~}], \"constraints\": ~A, ~
+                                    \"lookups\": [~{~A~^,~}], \"Z\": ~A, \"beta\": ~A, \"proof\": \"~(~{~2,'0X~}~)\", ~
+                                    \"roots\": [~{~A~^,~}], \"claims\": {~{~A~^,~}}}~:[~;,~]~%"
+                               (sable.domain:domain-name domain) (getf case :n) (getf case :k) (getf case :merge) d
+                               (loop for column in (sable.domain:domain-columns domain)
+                                     collect (format nil "{\"name\": \"~(~A~)\", \"kind\": \"~(~A~)\", \"c\": ~D, \"shared\": ~:[false~;true~]}"
+                                                     (sable.domain:column-name column) (sable.domain:column-kind column)
+                                                     (sable.domain:column-c column) (sable.domain:column-shared column)))
+                               (json-form (sable.domain:domain-constraints domain))
+                               (loop for lookup in (sable.domain:domain-lookups domain)
+                                     collect (format nil "{\"tag\": ~A, \"values\": ~A, \"num\": ~A}"
+                                                     (json-form (getf lookup :tag)) (json-form (getf lookup :values))
+                                                     (if (getf lookup :num) (json-form (getf lookup :num)) "null")))
+                               (json-ints z) (json-exts betas) (coerce (sable.proofio:encode-proof messages) 'list)
+                               (loop for (p . q) in roots collect (format nil "[~A,~A]" (json-ints p) (json-ints q)))
+                               (loop for (name point value) in claims
+                                     collect (format nil "\"~(~A~)\": {\"point\": ~A, \"value\": ~A}"
+                                                     name (json-exts point)
+                                                     (if (typep value 'ext) (json-exts (list value)) (json-exts value))))
+                               (or more (/= d 8)))))))))
+    (format out "]~%"))
+  path)

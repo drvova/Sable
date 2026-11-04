@@ -210,9 +210,11 @@ base-field integers, and each term costs one base-times-extension product by its
       (flet ((at (x)
                "STATEMENT's code with each table variable bound to its line value at X."
                `(let ,(loop for name in table-names for line in lines collect `(,name ,(nth x line)))
+                  (declare (ignorable ,@table-names))
                   ,code)))
         `(lambda (,tables ,low ,high ,@constant-names)
            (declare (type list ,tables) (type simple-vector ,low ,high) (optimize speed)
+                    (ignorable ,@constant-names)
                     (sb-ext:muffle-conditions sb-ext:compiler-note))
            (destructuring-bind ,table-vars ,tables
              (let* (,@(loop for table in table-vars for e in entries

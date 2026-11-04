@@ -3,9 +3,11 @@
 #   make core       sable.core, for `sbcl --core sable.core'
 #   make test       compile and run the test suite
 #   make vectors    regenerate tests/vectors.sexp from the Python code (numpy, blake3, g++)
-#   make crosscheck check the Lisp GKR proofs with the original C++ verifier (numpy, g++)
+#   make crosscheck check Lisp proofs with the original verifiers: GKR with zk/cuda/vcore.cpp
+#                   (numpy, g++); domains with zk/domain.py (also PyTorch, CPU build: PYTHON=...)
 SBCL ?= sbcl
 HEAP ?= 8GB
+PYTHON ?= python3
 SRC := sable.asd build.lisp $(wildcard src/*.lisp) $(wildcard tests/*.lisp) tests/vectors.sexp
 
 all: sable
@@ -27,9 +29,13 @@ vectors:
 
 crosscheck:
 	$(SBCL) --non-interactive --eval '(require "asdf")' --eval '(asdf:load-asd (truename "sable.asd"))' \
-	  --eval '(asdf:load-system "sable/tests")' --eval '(sable.tests::export-gkr-cases "gkr-cases.json")'
+	  --eval '(asdf:load-system "sable/tests")' --eval '(sable.tests::export-gkr-cases "gkr-cases.json")' \
+	  --eval '(sable.tests::export-domain-cases "domain-cases.json")'
 	cd .. && python3 lisp/tests/check-gkr-vcore.py lisp/gkr-cases.json
-	rm -f gkr-cases.json
+	@if $(PYTHON) -c "import torch" 2>/dev/null; then \
+	  cd .. && $(PYTHON) lisp/tests/check-domain-python.py lisp/domain-cases.json; \
+	else echo "skipping the domain check: $(PYTHON) has no PyTorch (make crosscheck PYTHON=...)"; fi
+	rm -f gkr-cases.json domain-cases.json
 
 clean:
 	rm -f sable sable.core
