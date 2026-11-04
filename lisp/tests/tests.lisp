@@ -57,7 +57,7 @@
   ;; the code behind EXT* is a form that can be read ...
   (let ((code (tower-code 'mul* 4)))
     (assert (eq (first code) 'lambda))
-    (assert (equal (second code) '(sable.field::a sable.field::b))))
+    (assert (equal (second code) '(sable.field::a sable.field::b sable.field::out))))
   ;; ... and any power-of-two degree works, though only 4 and 8 are used (16 works too, but
   ;; its 4,600-cons inverse takes seconds to compile)
   (let ((state (sb-ext:seed-random-state 7)))

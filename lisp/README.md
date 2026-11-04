@@ -50,10 +50,27 @@ prover, the verifier and the final check:
 ```
 
 The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
-recursively over the levels (Karatsuba, and the norm one level down), on symbolic coordinates.
-`(tower-code 'mul* 8)` returns the resulting straight-line `lambda` form. `ext*` and `ext-inv`
-compile that code on first use for whatever degree they are given. On the sumcheck demo with 14
-variables, proving takes 0.19 s, against 0.26 s with the earlier hand-written routines.
+on symbolic coordinates:
+
+- **`mul*`** uses the fact that the tower of degree D is F_p[w]/(w^D - 3) for its top generator w,
+  with the coordinates in bit-reversed order. So it is the schoolbook product. Each output
+  coefficient is one sum of D products, reduced once per four products, since four products of
+  values below p fit in an unsigned 64-bit word (lazy reduction).
+- **`inv*`** recurses over the levels, taking the norm one level down.
+
+`(tower-code 'mul* 8)` returns the resulting straight-line `lambda` form, and `ext*` and `ext-inv`
+compile it on first use for whatever degree they are given. Field addition and subtraction have no
+branches. Every operation takes an optional `out` vector to write into, so a caller that reuses
+buffers allocates nothing.
+
+On this machine (SBCL 2.2.9, a noisy virtual machine):
+
+| Measurement | Karatsuba tower | Now |
+|---|---|---|
+| F_p8 multiply | 520–550 ns | 77–96 ns, 0 bytes allocated when writing into `out` |
+| F_p4 multiply | about 183 ns | about 40 ns |
+| Sumcheck demo, 14 variables | 0.19 s | 0.06–0.09 s |
+| Sumcheck demo, 16 variables | 0.43 s | 0.23 s |
 
 ## What is ported
 
@@ -61,7 +78,7 @@ variables, proving takes 0.19 s, against 0.26 s with the earlier hand-written ro
 |---|---|---|
 | `util.lisp` | | octet vectors, little-endian integers |
 | `conditions.lisp` | (`ValueError`, `assert`) | the condition hierarchy, `check-parameter` |
-| `field.lisp` | `zk/field.py`, `zk/fe.py` | KoalaBear F_p, the tower (`mul*`, `inv*`, `tower-code`), Lagrange interpolation, eq tables, MLE evaluation |
+| `field.lisp` | `zk/field.py`, `zk/fe.py` | KoalaBear F_p with branchless addition, the tower (`mul*` as a lazily reduced schoolbook product, `inv*`, `tower-code`), Lagrange interpolation, eq tables, MLE evaluation |
 | `forms.lisp` | `zk/poly.py`, the expressions of `zk/sumcheck.py` | arithmetic forms: `expand`, `normalize`, `form-degree`, `arithmetic-form`, `compile-form`, `evaluate` |
 | `blake3.lisp` | `zk/cuda/b3s.h`, `blake3` | the sequential BLAKE3 mode of the transcript, and standard BLAKE3 |
 | `transcript.lisp` | `zk/transcript.py` | the Fiat-Shamir transcript |

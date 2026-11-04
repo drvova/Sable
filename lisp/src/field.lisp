@@ -10,12 +10,13 @@
 ;;;; second half the coefficient of the top generator (z for F_p8, y for F_p4, x for F_p2), so
 ;;;; each level is a pair of elements of the level below.
 ;;;;
-;;;; Multiplication and inversion are written once, recursively over the levels, as functions on
-;;;; symbolic coordinates (MUL*, INV*).  TOWER-CODE runs them on the coordinates of the arguments
-;;;; and returns the resulting LAMBDA form, straight-line fixnum code for one degree;
-;;;; TOWER-FUNCTION compiles it on first use.  So any power-of-two degree works, and the code
-;;;; behind EXT* can be read: (tower-code 'mul* 4).  The functions return fresh EXTs and never
-;;;; modify their arguments.
+;;;; Multiplication and inversion are written once, as functions on symbolic coordinates: MUL*,
+;;;; the lazily reduced schoolbook product over F_p[w]/(w^D - 3), and INV*, recursive over the
+;;;; levels.  TOWER-CODE runs them on the coordinates of the arguments and returns the resulting
+;;;; LAMBDA form, straight-line fixnum code for one degree; TOWER-FUNCTION compiles it on first
+;;;; use.  So any power-of-two degree works, and the code behind EXT* can be read:
+;;;; (tower-code 'mul* 4).  The operations write into an optional OUT vector, fresh by default,
+;;;; and never modify their other arguments.
 
 (defpackage #:sable.field
   (:use #:cl #:sable.conditions)
@@ -36,25 +37,35 @@
 
 ;;; ------------------------------------------------------------------ F_p
 
-;; Two values below p multiply to less than 2^62, a fixnum on 64-bit SBCL, so with these
-;; declarations the arithmetic compiles to machine operations.
-(declaim (inline modp fadd fsub fneg fmul))
+;; Two values below p multiply to less than 2^62, a fixnum on 64-bit SBCL, and four such products
+;; sum to less than 2^64, an unsigned machine word; with these declarations the arithmetic
+;; compiles to machine operations.  Addition and subtraction have no branches: on random data a
+;; branch on the carry is mispredicted half the time.
+(declaim (inline modp fadd fsub fneg fmul times-3))
 
 (defun modp (x)
   "The residue of the integer X in [0, p)."
   (mod x +p+))
 
 (defun fadd (a b)
+  "A + B: subtract p, then add it back if that went below zero (the sign as a mask)."
   (declare (type fp a b) (optimize speed))
-  (let ((s (+ a b))) (if (< s +p+) s (- s +p+))))
+  (let ((s (- (+ a b) +p+)))
+    (sb-ext:truly-the fp (+ s (logand +p+ (ash s -63))))))
 
 (defun fsub (a b)
+  "A - B: add p back if the difference is negative (the sign as a mask)."
   (declare (type fp a b) (optimize speed))
-  (if (>= a b) (- a b) (+ (- a b) +p+)))
+  (let ((d (- a b)))
+    (sb-ext:truly-the fp (+ d (logand +p+ (ash d -63))))))
 
 (defun fneg (a)
-  (declare (type fp a))
-  (if (zerop a) 0 (- +p+ a)))
+  (fsub 0 a))
+
+(defun times-3 (a)
+  "3A, the non-residue times A, by additions."
+  (let ((a2 (fadd a a)))
+    (fadd a2 a)))
 
 (defun fmul (a b)
   (declare (type fp a b) (optimize speed))
@@ -96,6 +107,7 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
   (check-parameter d (lambda (d) (typep d 'degree)) "4 or 8")
   d)
 
+(declaim (inline make-ext))
 (defun make-ext (d)
   "The zero of F_p^D."
   (make-array d :element-type '(unsigned-byte 32) :initial-element 0))
@@ -119,35 +131,43 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
       (replace (make-ext d) a)))
 
 ;;; ------------------------------------------------------------------ arithmetic
+;;;
+;;; Each operation writes its result into OUT, a fresh EXT by default.  OUT may be one of the
+;;; arguments: every coordinate is read before any is written.
 
 (defun ext= (a b) (equalp a b))
-;; Elementwise operations.  With the types declared, SBCL open-codes the MAPs.
 
-(defun ext+ (a b)
+(defun ext+ (a b &optional (out (make-ext (length a))))
   "A + B."
-  (declare (type ext a b) (optimize speed))
-  (map 'ext #'fadd a b))
+  (declare (type ext a b out) (optimize speed))
+  (dotimes (i (length a) out)
+    (setf (aref out i) (fadd (aref a i) (aref b i)))))
 
-(defun ext- (a b)
+(defun ext- (a b &optional (out (make-ext (length a))))
   "A - B."
-  (declare (type ext a b) (optimize speed))
-  (map 'ext #'fsub a b))
+  (declare (type ext a b out) (optimize speed))
+  (dotimes (i (length a) out)
+    (setf (aref out i) (fsub (aref a i) (aref b i)))))
 
-(defun ext-neg (a)
+(defun ext-neg (a &optional (out (make-ext (length a))))
   "-A."
-  (declare (type ext a) (optimize speed))
-  (map 'ext #'fneg a))
+  (declare (type ext a out) (optimize speed))
+  (dotimes (i (length a) out)
+    (setf (aref out i) (fneg (aref a i)))))
 
-(defun ext-scale (a s)
+(defun ext-scale (a s &optional (out (make-ext (length a))))
   "A times the base element S."
-  (declare (type ext a) (optimize speed))
+  (declare (type ext a out) (optimize speed))
   (let ((s (modp s)))
     (declare (type fp s))
-    (map 'ext (lambda (x) (fmul x s)) a)))
+    (dotimes (i (length a) out)
+      (setf (aref out i) (fmul (aref a i) s)))))
 
-;;; The tower, on symbolic coordinates: an element is a list of forms, one per coordinate.  Each
-;;; level is a pair (A0, A1) = A0 + A1 w of elements of the level below, where w is the level's
-;;; generator (x in F_p2, y in F_p4, z in F_p8) and w^2 the generator of the level below (3 in F_p).
+;;; The tower, on symbolic coordinates: an element is a list of forms, one per coordinate, in the
+;;; tower order.  Each level is a pair (A0, A1) = A0 + A1 w of elements of the level below, where
+;;; w is the level's generator (x in F_p2, y in F_p4, z in F_p8) and w^2 the generator of the
+;;; level below (3 in F_p).  So the tower of degree D is also F_p[w]/(w^D - 3) for its top
+;;; generator w, whose powers are the coordinates in bit-reversed order (POWER-ORDER).
 ;;; Intermediate values are bound once, as they are produced (BIND).
 
 (defvar *bindings* '()
@@ -160,34 +180,58 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
                   (push (list variable form) *bindings*)
                   variable)))
 
+(defun bound (coordinates)
+  "COORDINATES, bound to variables unless they are variables already."
+  (if (every #'symbolp coordinates) coordinates (bind coordinates)))
+
 (defun split (a)
   "The constant term and the top coefficient of A, two elements of the level below."
   (let ((h (floor (length a) 2)))
     (values (subseq a 0 h) (subseq a h))))
 
-(defun add* (a b) (mapcar (lambda (x y) `(fadd ,x ,y)) a b))
 (defun sub* (a b) (mapcar (lambda (x y) `(fsub ,x ,y)) a b))
 (defun neg* (a) (mapcar (lambda (x) `(fneg ,x)) a))
+
+(defun bit-reverse (i bits)
+  (loop for b below bits
+        sum (ash (ldb (byte 1 b) i) (- bits 1 b))))
+
+(defun power-order (a)
+  "A's coordinates by power of the top generator w (its own inverse).  In F_p8 the coordinate of
+x^i y^j z^k is at index i + 2j + 4k, and x^i y^j z^k = z^(4i + 2j + k): the index bit-reversed."
+  (let ((bits (1- (integer-length (length a)))))
+    (loop for e below (length a)
+          collect (nth (bit-reverse e bits) a))))
 
 (defun mul-by-generator* (a)
   "A w, for w the generator of A's level: (A0 + A1 w) w = A1 w^2 + A0 w."
   (if (rest a)
       (multiple-value-bind (a0 a1) (split a)
         (append (mul-by-generator* a1) a0))
-      (list `(fmul +nonres+ ,(first a)))))
+      (list `(times-3 ,(first a)))))
+
+(defun reduced-sum (products)
+  "The sum of PRODUCTS (forms, each below p^2) mod p, reduced once per four products: four fit
+in an unsigned 64-bit word."
+  (reduce (lambda (x y) `(fadd ,x ,y))
+          (loop for tail on products by (lambda (l) (nthcdr 4 l))
+                collect `(mod (+ ,@(subseq tail 0 (min 4 (length tail)))) +p+))))
 
 (defun mul* (a b)
-  "A B on symbolic coordinates, by Karatsuba:
-  (A0 + A1 w)(B0 + B1 w) = (A0 B0 + A1 B1 w^2) + ((A0 + A1)(B0 + B1) - A0 B0 - A1 B1) w."
-  (if (rest a)
-      (multiple-value-bind (a0 a1) (split a)
-        (multiple-value-bind (b0 b1) (split b)
-          (let ((lo (bind (mul* a0 b0)))
-                (hi (bind (mul* a1 b1)))
-                (mid (bind (mul* (bind (add* a0 a1)) (bind (add* b0 b1))))))
-            (append (add* lo (mul-by-generator* hi))
-                    (sub* (sub* mid lo) hi)))))
-      (list `(fmul ,(first a) ,(first b)))))
+  "A B on symbolic coordinates, as the schoolbook product in F_p[w]/(w^D - 3):
+  c_e = sum_{i+j=e} a_i b_j + 3 sum_{i+j=e+D} a_i b_j,
+each coefficient one sum of D products with B's wrapping coefficients tripled first, and reduced
+lazily (REDUCED-SUM)."
+  (let* ((d (length a))
+         (a (power-order (bound a)))
+         (b (power-order (bound b)))
+         ;; 3 b_j, for the j that wrap (j >= 1)
+         (b3 (cons nil (bind (mapcar (lambda (x) `(times-3 ,x)) (rest b))))))
+    (power-order
+     (loop for e below d
+           collect (reduced-sum (loop for i below d
+                                      for j = (mod (- e i) d)
+                                      collect `(* ,(nth i a) ,(nth j (if (> i e) b3 b)))))))))
 
 (defun inv* (a)
   "1/A on symbolic coordinates, for nonzero A:
@@ -199,8 +243,8 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
       (list `(finv ,(first a)))))
 
 (defun tower-code (operation degree)
-  "The LAMBDA form computing OPERATION (MUL* or INV*, of two or one EXTs) in degree DEGREE:
-OPERATION run on the arguments' coordinates, as straight-line code."
+  "The LAMBDA form computing OPERATION (MUL* or INV*, of two or one EXTs) in degree DEGREE into
+its last argument, OUT: OPERATION run on the arguments' coordinates, as straight-line code."
   (let* ((*bindings* '())
          (arguments (subseq '(a b) 0 (if (eq operation 'inv*) 1 2)))
          (result (apply operation
@@ -208,16 +252,15 @@ OPERATION run on the arguments' coordinates, as straight-line code."
                                   (bind (loop for i below degree collect `(aref ,argument ,i))))
                                 arguments)))
          (bindings (reverse *bindings*)))
-    `(lambda ,arguments
-       (declare (type ext ,@arguments) (optimize speed)
+    `(lambda (,@arguments out)
+       (declare (type ext ,@arguments out) (optimize speed)
                 (sb-ext:muffle-conditions sb-ext:compiler-note))
        (let* ,bindings
          (declare (type fp ,@(mapcar #'first bindings)))
-         (let ((result (make-ext ,degree)))
-           (setf ,@(loop for form in result
-                         for i from 0
-                         append `((aref result ,i) ,form)))
-           result)))))
+         (setf ,@(loop for form in result
+                       for i from 0
+                       append `((aref out ,i) ,form)))
+         out))))
 
 (defvar *tower-functions* '()
   "An alist: operation -> a hash table, degree -> the compiled TOWER-CODE.")
@@ -241,22 +284,22 @@ degree in front of TOWER-FUNCTION (EXT* calls it for every product)."
 (defparameter *multiplier* (by-degree 'mul*))
 (defparameter *inverter* (by-degree 'inv*))
 
-(defun ext* (a b)
+(defun ext* (a b &optional (out (make-ext (length a))))
   "A B."
-  (funcall (the function (funcall *multiplier* (length a))) a b))
+  (funcall (the function (funcall *multiplier* (length a))) a b out))
 
-(defun ext-inv (a)
+(defun ext-inv (a &optional (out (make-ext (length a))))
   "1/A.  The inverse of zero signals FIELD-DIVISION-BY-ZERO, with the restarts USE-VALUE and
 RETURN-ZERO."
   (if (some #'plusp a)
-      (funcall (funcall *inverter* (length a)) a)
+      (funcall (the function (funcall *inverter* (length a))) a out)
       (restart-case (error 'field-division-by-zero :operation 'ext-inv :operands (list a))
         (use-value (inverse)
           :report "Supply the inverse to use."
-          (coerce-ext inverse))
+          (replace out (coerce-ext inverse)))
         (return-zero ()
           :report "Return 0, as the Python and C++ code does."
-          (make-ext (length a))))))
+          (fill out 0)))))
 
 (defun ext-expt (a e)
   (loop with result = (ext-one (length a))
