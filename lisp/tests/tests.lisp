@@ -383,3 +383,91 @@
                 (dolist (l0 '(2 3 4))
                   (assert (equalp (proof l0) folded) () "~S, n = ~D, D = ~D, L0 = ~D, eq ~A"
                           statement n d l0 with-eq))))))))))
+
+;;; ------------------------------------------------------------------ LogUp-GKR
+
+(defun random-leaves (lookups n k d state)
+  "LOOKUPS pairs of K blocks of 2^N random fractions (p . q), q nonzero."
+  (flet ((random-ext (&optional nonzero)
+           (loop for e = (coerce-ext (loop repeat d collect (random +p+ state)))
+                 unless (and nonzero (every #'zerop e)) return e)))
+    (loop repeat lookups
+          collect (cons (coerce (loop repeat (* k (expt 2 n)) collect (random-ext)) 'vector)
+                        (coerce (loop repeat (* k (expt 2 n)) collect (random-ext t)) 'vector)))))
+
+(defun gkr-proof (n k leaves d)
+  "Prove the upper layers; return the messages and the prover's outputs."
+  (let ((tr (make-transcript "gkr-test" d)))
+    (multiple-value-bind (ri rb cp cq) (sable.gkr:prove-upper tr n k leaves)
+      (values (transcript-messages tr) (list ri rb cp cq)))))
+
+(defun test-gkr-roundtrip ()
+  (dolist (case '((3 1 1 4) (3 3 2 4) (2 4 1 8) (4 5 2 4) (1 2 1 4) (1 1 2 8) (2 2 3 4)))
+    (destructuring-bind (n k lookups d) case
+      (let ((leaves (random-leaves lookups n k d (sb-ext:seed-random-state (+ n k lookups d)))))
+        (multiple-value-bind (messages outputs) (gkr-proof n k leaves d)
+          (let ((tr (make-transcript "gkr-test" d :messages messages)))
+            (multiple-value-bind (roots ri rb cp cq) (sable.gkr:verify-upper tr n k lookups)
+              (assert (transcript-finished-p tr))
+              (assert (equalp (list ri rb cp cq) outputs) () "~S: verifier and prover disagree" case)
+              ;; LogUp: each root is the sum of its leaf fractions
+              (loop for (p . q) in leaves
+                    for (root-p . root-q) in roots
+                    do (assert (ext= (ext* root-p (ext-inv root-q))
+                                     (reduce #'ext+ (map 'list (lambda (a b) (ext* a (ext-inv b))) p q)))))
+              ;; the claims are on the leaves' parents, sum_{b<K} eq(rb, b) parent_b(ri)
+              (multiple-value-bind (layers) (sable.gkr:fraction-trees leaves n k)
+                (loop for (p . q) in (aref layers (1- n))
+                      for claim-p in cp
+                      for claim-q in cq
+                      do (flet ((claim (values)
+                                  (let ((size (expt 2 (1- n)))
+                                        (weights (if rb (sable.field:eq-table rb d) (vector (ext-one d)))))
+                                    (reduce #'ext+
+                                            (loop for b below k
+                                                  collect (ext* (aref weights b)
+                                                                (mle-eval (subseq values (* b size) (* (1+ b) size))
+                                                                          ri d)))))))
+                           (assert (ext= claim-p (claim p)))
+                           (assert (ext= claim-q (claim q)))))))))))))
+
+(defun test-gkr-rejects-forgeries ()
+  (let* ((n 3) (k 3) (lookups 2) (d 4)
+         (leaves (random-leaves lookups n k d (sb-ext:seed-random-state 9))))
+    (multiple-value-bind (messages) (gkr-proof n k leaves d)
+      (flet ((verify (messages)
+               (sable.gkr:verify-upper (make-transcript "gkr-test" d :messages messages) n k lookups)))
+        (assert (verify messages))
+        ;; change one value in each field message in turn: every change must be rejected
+        (loop for i below (length messages)
+              for m = (aref messages i)
+              when (typep m 'field-array)
+                do (let ((forged (copy-seq messages))
+                         (changed (make-array (array-dimensions m) :element-type '(unsigned-byte 32))))
+                     (dotimes (j (array-total-size m))
+                       (setf (row-major-aref changed j) (row-major-aref m j)))
+                     (setf (row-major-aref changed 0) (fadd (row-major-aref changed 0) 1)
+                           (aref forged i) changed)
+                     (assert (signalled 'verification-failure (lambda () (verify forged))) ()
+                             "message ~D: forgery accepted" i)))))))
+
+(defun export-gkr-cases (path)
+  "Write GKR proofs made by PROVE-UPPER, with the verifier's outputs, as JSON for
+tests/check-gkr-vcore.py, which checks them with zk/cuda/vcore.cpp's vc_gkr_upper."
+  (flet ((ints (exts) (format nil "[~{~A~^,~}]" (loop for e in exts append (coerce e 'list)))))
+    (with-open-file (out path :direction :output :if-exists :supersede)
+      (format out "[~%")
+      (loop for (case . more) on '((3 1 1 4) (3 3 2 4) (2 4 1 8) (4 5 2 4) (1 2 1 4) (1 1 2 8) (2 2 3 4) (5 6 2 8))
+            do (destructuring-bind (n k lookups d) case
+                 (let ((leaves (random-leaves lookups n k d (sb-ext:seed-random-state (* 7 (+ n k lookups d))))))
+                   (multiple-value-bind (messages) (gkr-proof n k leaves d)
+                     (multiple-value-bind (roots ri rb cp cq)
+                         (sable.gkr:verify-upper (make-transcript "gkr-test" d :messages messages) n k lookups)
+                       (format out "{\"n\": ~D, \"K\": ~D, \"L\": ~D, \"D\": ~D, \"label\": \"gkr-test\", ~
+                                    \"proof\": \"~(~{~2,'0X~}~)\", \"roots\": ~A, \"ri\": ~A, \"rb\": ~A, ~
+                                    \"cp\": ~A, \"cq\": ~A}~:[~;,~]~%"
+                               n k lookups d (coerce (sable.proofio:encode-proof messages) 'list)
+                               (ints (loop for (p . q) in roots collect p collect q))
+                               (ints ri) (ints rb) (ints cp) (ints cq) more))))))
+      (format out "]~%"))
+    path))

@@ -152,18 +152,49 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `proofio.lisp` | `zk/proofio.py` | the proof byte format (`SABLEPF1`) |
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code |
 | `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`), split eq weights, and the first rounds of base tables answered from small-value accumulators (`small-value-code`) |
+| `gkr.lisp` | `zk/gkr.py`, `vc_gkr_upper` in `zk/cuda/vcore.cpp` | batched LogUp-GKR fractional sums: `verify-upper`, a CPU reference prover `prove-upper`, the layer statement as a form |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
 workaround is not needed: a layer parameter is just another variable.
 
+**LogUp-GKR.** `verify-upper` checks the upper layers of the fraction trees, batched over the
+lookups:
+
+- **Roots and top tree:** the proof sends each lookup's root fraction, then proves each layer from
+  the one above, first over the top tree of block roots, then in-block.
+- **Layer statement:** each layer is a sumcheck of one statement form, Σ_l a_l (p0 q1 + p1 q0) +
+  a_l λ q0 q1, built by `layer-statement`.
+- **Block phase:** each in-block layer sums over the blocks with eq weights, then binds the block
+  index in a second sumcheck.
+
+`prove-upper` is a CPU reference prover for the same layers, and the sumcheck prover gained what
+it needs for this:
+- an in-block phase with given block weights (`:block-weights`)
+- an explicit header degree (`:degree`; zk/ writes 0 for a sumcheck of no rounds)
+- the folded tables as a third value
+
+**Cross-check against the original C++ verifier.** No GPU is needed for this check.
+`make crosscheck` has the Lisp prover make proofs for 8 shapes: 1 to 6 blocks (including
+non-powers of two), 1 to 3 lookups, and F_p^4 and F_p^8. It then checks each with
+`vc_gkr_upper` from `zk/cuda/vcore.cpp`, the verifier that `llm.verify` uses on the host:
+
+- the C++ verifier accepts every proof and consumes every message
+- it computes the same roots, points and claims as the Lisp verifier
+- it rejects every proof with one value changed (231 forgeries)
+
+The Lisp tests add LogUp's meaning: each root fraction equals the sum of its leaf fractions, and
+the claims equal the multilinear extension of the leaves' parent layer.
+
 Not ported yet:
 
-- The rest of the verifier: LogUp-GKR (`gkr.verify_upper`), the BaseFold opening and Merkle
-  query checks of the polynomial commitment (`gpcs.py`), and the transformer protocol (`llm.verify`).
-  `read-proof-file` parses a real proof, but a real proof cannot be verified yet.
-- The GPU prover: the kernels generated for NVRTC, CuPy and PyTorch. It is not a candidate for a
-  direct port.
+- **The rest of the verifier:** the leaf layer and constraint checks of a domain (`domain.verify`),
+  the BaseFold opening and Merkle query checks of the polynomial commitment (`gpcs.py`), and the
+  transformer protocol (`llm.verify`). `read-proof-file` parses a real proof, but a real proof
+  cannot be verified yet. Producing one needs the GPU prover, so end-to-end checks need a machine
+  with an NVIDIA GPU.
+- **The GPU prover:** the kernels generated for NVRTC, CuPy and PyTorch. It is not a candidate for
+  a direct port.
 
 ## Build
 
@@ -172,6 +203,7 @@ make            # ./sable, a standalone executable (runs the tests first; HEAP=8
 make core       # sable.core, for `sbcl --core sable.core' (starts in SABLE-USER)
 make test       # compile and run the tests (asdf:test-system "sable")
 make vectors    # regenerate tests/vectors.sexp from the Python code (numpy, blake3, g++)
+make crosscheck # check the Lisp GKR proofs with the original C++ verifier (numpy, g++)
 ```
 
 ## Use

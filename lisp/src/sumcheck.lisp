@@ -144,13 +144,15 @@ the eq-mode coordinate of the round, or NIL."
                   (ext- claim g0))))
       (lagrange (list* g0 g1 g2-and-up) x))))
 
-(defun verify (tr n statement claim &key eq constants (blocks 1) (label "sc"))
+(defun verify (tr n statement claim &key eq constants (blocks 1) (label "sc")
+                                         (degree (statement-degree statement constants)))
   "Replay the N-round sumcheck of STATEMENT on the verifier transcript TR.  CLAIM is an EXT (or
 its coordinates); EQ, in eq mode, a sequence of at least N EXTs; CONSTANTS an alist of the
-statement's non-table variables.  Returns the round challenges and the reduced claim, for
-CHECK-FINAL.  A round message of the wrong shape signals MESSAGE-SHAPE-ERROR."
-  (let* ((degree (statement-degree statement constants))
-         (shape (list (max degree 1) (transcript-degree tr)))
+statement's non-table variables; BLOCKS the number of blocks summed in each round (the header's
+K); DEGREE the round polynomials' degree as the header states it (zk/ uses 0 when N is 0).
+Returns the round challenges and the reduced claim, for CHECK-FINAL.  A round message of the wrong
+shape signals MESSAGE-SHAPE-ERROR."
+  (let* ((shape (list (max degree 1) (transcript-degree tr)))
          (claim (coerce-ext claim)))
     (absorb tr (header label n degree blocks))
     (values (loop for j below n
@@ -505,23 +507,32 @@ sum_b eq(rhos, b) T(b, y), D base products per term."
         (ext+ acc (ext-scale (svref eqs b) (aref entries (+ (* y block) b)) term) acc))
       (replace bound acc :start1 (* d y)))))
 
-(defun prove (tr n statement tables &key eq constants (label "sc"))
+(defun prove (tr n statement tables &key eq constants (label "sc") block-weights
+                                        (degree (statement-degree statement constants)))
   "Prove the sumcheck of STATEMENT on the prover transcript TR (a reference prover, on the CPU).
 TABLES: an alist (variable . 2^N base elements or EXTs).  With base tables and no constants, the
 first *SMALL-VALUE-ROUNDS* rounds come from one base-field pass (small values); the others run the
-statement's compiled ROUND-KERNEL, with the eq weights split in two (SPLIT-WEIGHTS).  Returns the
-round challenges and the finals, an alist (variable . EXT at the challenges) for CHECK-FINAL."
+statement's compiled ROUND-KERNEL, with the eq weights split in two (SPLIT-WEIGHTS).
+
+With BLOCK-WEIGHTS (K EXTs), each table holds K blocks of 2^N entries, block-major, and the
+statement summed is sum_b bw_b sum_x eq(r, x) F(tables(x, b)): the N rounds bind the in-block
+variables (zk/sumcheck.py prove with K and bw).  DEGREE is the round polynomials' degree as the
+header states it (zk/ uses 0 when N is 0).
+
+Returns the round challenges, the finals (an alist (variable . EXT at the challenges, block 0) for
+CHECK-FINAL) and the folded tables (an alist (variable . vector of the K blocks' EXTs))."
   (let* ((d (transcript-degree tr))
-         (points (max (statement-degree statement constants) 1))
+         (points (max degree 1))
          (names (mapcar #'car tables))
          (constant-names (mapcar #'car constants))
          (constant-values (mapcar #'cdr constants))
          (flat (loop for (nil . values) in tables collect (make-table values d)))
          (g (1+ points))
          (rhos '()))
-    (absorb tr (header label n (statement-degree statement constants)))
+    (absorb tr (header label n degree (if block-weights (length block-weights) 1)))
     (multiple-value-bind (l0 kernel)
         (and (null constants)
+             (null block-weights)
              (every (lambda (table) (= (table-stride table) 1)) flat)
              (choose-small-value-kernel statement names d n g))
       (when kernel
@@ -532,7 +543,10 @@ round challenges and the finals, an alist (variable . EXT at the challenges) for
           (setf flat (mapcar (lambda (table) (bind-prefix table rhos d)) flat)))))
     (values (append rhos
                     (loop for j from (length rhos) below n
-                          collect (multiple-value-bind (low high) (split-weights eq (1+ j) n d)
+                          collect (multiple-value-bind (low high)
+                                      (if block-weights
+                                          (values (weights eq (1+ j) n d) (coerce block-weights 'simple-vector))
+                                          (split-weights eq (1+ j) n d))
                                     (let* ((base (and (null constants)
                                                       (every (lambda (table) (= (table-stride table) 1)) flat)))
                                            (kernel (round-kernel statement names constant-names d points base))
@@ -547,7 +561,12 @@ round challenges and the finals, an alist (variable . EXT at the challenges) for
                                         r)))))
             (loop for name in names
                   for table in flat
-                  collect (cons name (table-entry table 0 (make-ext d)))))))
+                  collect (cons name (table-entry table 0 (make-ext d))))
+            (loop for name in names
+                  for table in flat
+                  collect (cons name (coerce (loop for x below (table-size table)
+                                                   collect (table-entry table x (make-ext d)))
+                                             'vector))))))
 
 ;;; ------------------------------------------------------------------ demonstration
 

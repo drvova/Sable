@@ -19,6 +19,7 @@ implementation (zk/)."
                (:file "proofio")
                (:file "rs")
                (:file "sumcheck")
+               (:file "gkr")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "sable/tests"))))
 
