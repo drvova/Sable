@@ -21,6 +21,7 @@ implementation (zk/)."
                (:file "sumcheck")
                (:file "gkr")
                (:file "domain")
+               (:file "pcs")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "sable/tests"))))
 

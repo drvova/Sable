@@ -612,3 +612,134 @@ JSON for tests/check-domain-python.py, which checks them with zk/domain.py's ver
                                (or more (/= d 8)))))))))
     (format out "]~%"))
   path)
+
+;;; ------------------------------------------------------------------ the polynomial commitment
+
+;;; Scenarios: units (name (tensor K c0) ...), the merge set, the segment (or NIL) and cmax.
+(defparameter *pcs-scenarios*
+  '((:cmax 9 :seed 21 :merge ("12.g1" "12.g2") :segment ("12.g1" "12.g2")
+     :units (("w" ("wa" 2 9) ("wb" 1 6) ("wc" 1 3))      ; classes 5 to 9; v split into columns
+             ("12.g1" ("x" 3 8) ("y" 1 9))
+             ("12.g2" ("z" 2 7) ("u" 1 9))
+             ("big" ("v" 2 10))))
+    (:cmax 10 :seed 22 :merge ("3.a" "3.b") :segment nil   ; two oracle levels, depth-2 paths
+     :units (("w2" ("p" 1 10) ("q" 6 5))
+             ("3.a" ("r" 2 10))
+             ("3.b" ("s" 1 8) ("t" 4 6))))
+    (:cmax 9 :seed 23 :merge nil :segment ("7.a" "7.b") :max-points 2   ; points reduced in batches
+     :units (("7.a" ("e" 1 9) ("f" 2 9) ("g" 1 9))
+             ("7.b" ("h" 3 7))))))
+
+(defun pcs-data (units state)
+  "Random base-field tensors for UNITS: an alist tensor -> K 2^c0 values."
+  (loop for (nil . items) in units
+        append (loop for (tensor k c0) in items
+                     collect (cons tensor (coerce (loop repeat (* k (expt 2 c0)) collect (random +p+ state)) 'vector)))))
+
+(defun pcs-claims (units data state)
+  "Per unit, true claims: per tensor, two points, the first shared by two claims (one per block
+weighting), as (tensor point coefficients value)."
+  (loop for (name . items) in units
+        collect (cons name
+                      (loop for (tensor k c0) in items
+                            for values = (cdr (assoc tensor data :test #'equal))
+                            append (loop for p below 2
+                                         for point = (loop repeat c0 collect (coerce-ext (loop repeat 4 collect (random +p+ state))))
+                                         append (loop repeat (if (zerop p) 2 1)
+                                                      collect (let ((coefficients (loop for b below k
+                                                                                        collect (cons b (coerce-ext (loop repeat 4 collect (random +p+ state)))))))
+                                                                (list tensor point coefficients
+                                                                      (reduce #'ext+ (loop for (b . w) in coefficients
+                                                                                           collect (ext* w (mle-eval (subseq values (* b (expt 2 c0)) (* (1+ b) (expt 2 c0)))
+                                                                                                                     point 4)))
+                                                                              :initial-value (make-ext 4))))))))))
+
+(defun pcs-run (scenario tr prover data claims &key (queries 6) (grind 4))
+  "The commitment protocol of SCENARIO, as the prover (with DATA) or the verifier."
+  (destructuring-bind (&key cmax units merge segment (max-points 64) &allow-other-keys) scenario
+    (let ((pcs (sable.pcs:make-pcs tr :prover prover :cmax cmax :queries queries :grind grind))
+          (sable.pcs::*max-reduction-points* max-points))
+      (loop for (name . items) in units do (sable.pcs:pcs-declare pcs name items))
+      (when merge (sable.pcs:pcs-merge pcs merge))
+      (when segment (sable.pcs:pcs-segment-decl pcs segment))
+      (loop for (name . items) in units
+            do (sable.pcs:pcs-commit pcs name (and prover (loop for (tensor) in items
+                                                                collect (assoc tensor data :test #'equal)))))
+      (loop for (name . unit-claims) in claims
+            do (sable.pcs:pcs-open pcs name unit-claims)
+               (when (and segment (equal name (car (last segment)))) (sable.pcs:pcs-segment pcs 0)))
+      (sable.pcs:pcs-finish pcs))))
+
+(defvar *pcs-proofs* (make-hash-table) "Cached (data claims messages) per scenario.")
+
+(defun pcs-proof (scenario)
+  (or (gethash (getf scenario :seed) *pcs-proofs*)
+      (let* ((state (sb-ext:seed-random-state (getf scenario :seed)))
+             (data (pcs-data (getf scenario :units) state))
+             (claims (pcs-claims (getf scenario :units) data state))
+             (tr (make-transcript "pcs-test" 4)))
+        (pcs-run scenario tr t data claims)
+        (setf (gethash (getf scenario :seed) *pcs-proofs*) (list data claims (transcript-messages tr))))))
+
+(defun test-pcs-roundtrip ()
+  (dolist (scenario *pcs-scenarios*)
+    (destructuring-bind (data claims messages) (pcs-proof scenario)
+      (let ((tr (make-transcript "pcs-test" 4 :messages messages)))
+        (assert (pcs-run scenario tr nil data claims))
+        (assert (transcript-finished-p tr))))))
+
+(defun test-pcs-rejects-forgeries ()
+  (dolist (scenario *pcs-scenarios*)
+    (destructuring-bind (data claims messages) (pcs-proof scenario)
+      (flet ((rejected-p (forged &optional (claims claims))
+               (signalled 'verification-failure
+                          (lambda () (pcs-run scenario (make-transcript "pcs-test" 4 :messages forged) nil data claims)))))
+        ;; a false claim
+        (let ((false (copy-tree claims)))
+          (setf (fourth (second (first false))) (ext+ (fourth (second (first false))) (ext-one 4)))
+          (assert (rejected-p messages false)))
+        ;; every message changed: a field value, or a byte of a cap or path (the paths of a tree
+        ;; whose cap is its leaves are empty)
+        (loop for i below (length messages)
+              for m = (aref messages i)
+              unless (zerop (array-total-size m))
+                do (let ((forged (copy-seq messages)))
+                     (setf (aref forged i)
+                           (if (typep m 'byte-message)
+                               (let ((b (copy-seq m))) (setf (aref b 0) (logxor (aref b 0) 1)) b)
+                               (let ((a (make-array (array-dimensions m) :element-type '(unsigned-byte 32))))
+                                 (dotimes (j (array-total-size m)) (setf (row-major-aref a j) (row-major-aref m j)))
+                                 (setf (row-major-aref a 0) (fadd (row-major-aref a 0) 1))
+                                 a)))
+                     ;; a grinding nonce may still pass the (small) bound; every other change is rejected
+                     (unless (and (typep m 'byte-message) (= (length m) 8))
+                       (assert (rejected-p forged) () "message ~D (~A): forgery accepted" i (message-shape m)))))))))
+
+(defun export-pcs-cases (path)
+  "Write the commitment proofs of *PCS-SCENARIOS*, with their units and claims, as JSON for
+tests/check-pcs-python.py, which checks them with zk/gpcs.py's verifier."
+  (with-open-file (out path :direction :output :if-exists :supersede)
+    (format out "[~%")
+    (loop for (scenario . more) on *pcs-scenarios*
+          do (destructuring-bind (data claims messages) (pcs-proof scenario)
+               (declare (ignore data))
+               (destructuring-bind (&key cmax units merge segment (max-points 64) &allow-other-keys) scenario
+                 (format out "{\"label\": \"pcs-test\", \"cmax\": ~D, \"max_points\": ~D, \"queries\": 6, \"grind\": 4, ~
+                              \"units\": [~{~A~^,~}], \"merge\": [~{\"~A\"~^,~}], \"segment\": [~{\"~A\"~^,~}], ~
+                              \"claims\": [~{~A~^,~}], \"proof\": \"~(~{~2,'0X~}~)\"}~:[~;,~]~%"
+                         cmax max-points
+                         (loop for (name . items) in units
+                               collect (format nil "{\"name\": \"~A\", \"items\": [~{[\"~A\", ~D, ~D]~^,~}]}"
+                                               name (loop for item in items append item)))
+                         merge segment
+                         (loop for (name . unit-claims) in claims
+                               collect (format nil "{\"unit\": \"~A\", \"claims\": [~{~A~^,~}]}" name
+                                               (loop for (tensor point coefficients value) in unit-claims
+                                                     collect (format nil "{\"tensor\": \"~A\", \"point\": ~A, \"coefficients\": {~{~A~^,~}}, \"value\": ~A}"
+                                                                     tensor (json-exts point)
+                                                                     (loop for (b . w) in coefficients collect (format nil "\"~D\": ~A" b (json-ints w)))
+                                                                     (json-ints value)))))
+                         (coerce (sable.proofio:encode-proof messages) 'list)
+                         more))))
+    (format out "]~%"))
+  path)

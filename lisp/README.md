@@ -154,6 +154,7 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`), split eq weights, and the first rounds of base tables answered from small-value accumulators (`small-value-code`) |
 | `gkr.lisp` | `zk/gkr.py`, `vc_gkr_upper` in `zk/cuda/vcore.cpp` | batched LogUp-GKR fractional sums: `verify-upper`, a CPU reference prover `prove-upper`, the layer statement as a form |
 | `domain.lisp` | `zk/domain.py` | a domain (columns, zerocheck constraints, lookups) as data; its leaf-layer and zerocheck statement as one form; `verify-domain` and a CPU reference prover `prove-domain` |
+| `pcs.lisp` | `zk/gpcs.py` | the polynomial commitment: units and size classes, merged mixed-height Merkle trees with caps, the per-class point reductions, segments, the cross-unit sumcheck, BaseFold with oracles, grinding and the query checks; a CPU reference prover |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
@@ -220,11 +221,45 @@ blocks, every column kind, no lookups or no constraints, and F_p^4 and F_p^8.
   lookup uses. Such a final only becomes that column's claim, which the commitment's opening
   checks, and the Lisp verifier treats it the same way.
 
+**The polynomial commitment.** `pcs.lisp` ports `zk/gpcs.py`, the mixed-length BaseFold opening
+over rate-1/2 Reed-Solomon codes and BLAKE3 Merkle trees, with the same calls:
+`pcs-declare`, `pcs-merge`, `pcs-segment-decl`, `pcs-commit`, `pcs-open`, `pcs-segment` and
+`pcs-finish`.
+
+- **Units and trees:** a unit's columns are grouped by size class, and the classes of a unit or a
+  merge set share a mixed-height Merkle tree. Leaf digests are chained 64 columns at a time and
+  across the units of a merge set, and each tree sends its cap.
+- **Opening:** a sumcheck in F_p^4 reduces each class's claims to one point, in batches when there
+  are many points. A segment's units are brought to one point per class.
+- **`pcs-finish`:**
+  1. a cross-unit sumcheck in F_p^8
+  2. BaseFold, with each class joining the folded codeword at its level and oracle trees at even
+     levels
+  3. grinding
+  4. the query openings: every leaf against its tree's cap, then folded to the final table's
+     codeword
+
+`make-pcs :prover t` gives a CPU reference prover with the same messages.
+
+**Cross-check against Python's verifier.** `make crosscheck PYTHON=...` checks the Lisp prover's
+proofs with zk/gpcs.py's own verifier, on the host, in 3 scenarios:
+
+- a merge set and a segment, 5 size classes, columns split at `cmax`, a tensor below the smallest
+  class, and claims sharing points
+- `cmax` 10, with two oracle levels and depth-2 paths
+- point reductions in batches
+
+Python accepts each proof, consumes every message, and rejects every changed value or byte (287
+forgeries). The only messages left unchanged are the grinding nonce, which a few test bits of
+grinding may still accept, and the empty paths of trees whose cap is their leaves. The tests use
+6 queries and 4 bits of grinding instead of 153 and 30: grinding 30 bits on the CPU takes hours.
+Python's verifier takes both as parameters too.
+
 Not ported yet:
 
-- **The rest of the verifier:** the BaseFold opening and Merkle query checks of the polynomial
-  commitment (`gpcs.py`), and the transformer protocol (`llm.verify`): its statement, policy,
-  weight commitment and the domains of each layer. `read-proof-file` parses a real proof, but a real proof
+- **The transformer protocol (`llm.verify`):** its statement, policy, weight commitment, the
+  F_O model's domains of each layer and how they feed the commitment. The pieces it is built from
+  are ported: the sumcheck, LogUp-GKR, domains and the commitment. `read-proof-file` parses a real proof, but a real proof
   cannot be verified yet. Producing one needs the GPU prover, so end-to-end checks need a machine
   with an NVIDIA GPU.
 - **The GPU prover:** the kernels generated for NVRTC, CuPy and PyTorch. It is not a candidate for
@@ -237,8 +272,9 @@ make            # ./sable, a standalone executable (runs the tests first; HEAP=8
 make core       # sable.core, for `sbcl --core sable.core' (starts in SABLE-USER)
 make test       # compile and run the tests (asdf:test-system "sable")
 make vectors    # regenerate tests/vectors.sexp from the Python code (numpy, blake3, g++)
-make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.cpp (numpy, g++),
-                #   domains with zk/domain.py (also PyTorch: make crosscheck PYTHON=...)
+make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.cpp (numpy, g++);
+                #   domains and the commitment with zk/domain.py and zk/gpcs.py
+                #   (also PyTorch: make crosscheck PYTHON=...)
 ```
 
 ## Use
