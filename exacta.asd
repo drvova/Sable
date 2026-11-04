@@ -29,6 +29,7 @@ commitment and the transformer statement.  Ported from Sable's Python implementa
                (:file "tables")
                (:file "public")
                (:file "llm")
+               (:file "model")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "exacta/tests"))))
 
@@ -39,6 +40,8 @@ commitment and the transformer statement.  Ported from Sable's Python implementa
   :pathname "tests/"
   :components ((:file "framework")
                (:static-file "vectors.sexp")
+               (:static-file "models/tiny.exm")
+               (:static-file "models/qwen3.exm")
                (:file "tests"))
   :perform (test-op (o c)
              (unless (uiop:symbol-call '#:exacta.tests '#:run-tests)

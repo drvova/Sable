@@ -9,7 +9,8 @@
 
 (defpackage #:exacta.llm
   (:use #:cl #:exacta.util #:exacta.conditions #:exacta.sha256 #:exacta.proto)
-  (:export #:cfg #:make-cfg #:cfg-repr #:shape #:make-shape #:column-block-bits
+  (:export #:cfg #:make-cfg #:cfg-repr #:cfg-l #:cfg-d #:cfg-nh #:cfg-nkv #:cfg-dh #:cfg-dff #:cfg-v
+           #:cfg-theta #:cfg-qk-norm #:cfg-qkv-bias #:cfg-moe #:cfg-down-b #:shape #:make-shape #:column-block-bits
            #:commitment-layout #:declare-units
            #:policy #:make-policy #:encode-policy #:check-statement
            #:statement #:sampling-seed #:weights-digest #:+theta-count+))

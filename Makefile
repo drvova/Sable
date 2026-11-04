@@ -4,7 +4,7 @@
 #   make test       compile and run the test suite
 SBCL ?= sbcl
 HEAP ?= 8GB
-SRC := exacta.asd build.lisp $(wildcard src/*.lisp) $(wildcard tests/*.lisp) tests/vectors.sexp
+SRC := exacta.asd build.lisp $(wildcard src/*.lisp) $(wildcard tests/*.lisp) tests/vectors.sexp $(wildcard tests/models/*.exm)
 
 all: exacta
 

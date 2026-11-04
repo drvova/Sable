@@ -7,6 +7,7 @@
 ;;;;         message-shape-error          a proof message has the wrong kind or shape
 ;;;;         transcript-exhausted         the verifier asked for more messages than the proof holds
 ;;;;       invalid-parameter              a value outside a function's domain
+;;;;       witness-error                  an input outside F_O's domain: the honest prover refuses it
 ;;;;       field-division-by-zero         an inverse of zero (also CL:DIVISION-BY-ZERO)
 ;;;;
 ;;;; A verifier must never be talked into accepting a proof, so MALFORMED-PROOF and
@@ -24,6 +25,7 @@
            #:invalid-parameter #:invalid-parameter-name #:invalid-parameter-value #:invalid-parameter-expected
            #:check-parameter
            #:field-division-by-zero #:return-zero
+           #:witness-error #:witness-error-check #:witness
            #:malformed #:reject))
 
 (in-package #:exacta.conditions)
@@ -90,6 +92,20 @@
   (:report (lambda (c stream)
              (format stream "Proof rejected: the verifier needs message ~D, but the proof has no more"
                      (message-index c)))))
+
+;;; ------------------------------------------------------------------ witnesses
+
+(define-condition witness-error (exacta-error)
+  ((check :initarg :check :reader witness-error-check))
+  (:report (lambda (c stream)
+             (format stream "F_O: ~A (the input is outside the function's domain)" (witness-error-check c))))
+  (:documentation "A range check of F_O failed (model.WitnessError): the input lies outside the
+domain on which the integer function, and its proof, are defined, and the honest prover refuses it.
+No restart: there is no output to continue with."))
+
+(defun witness (condition check)
+  "Signal WITNESS-ERROR unless CONDITION holds; CHECK names it."
+  (unless condition (error 'witness-error :check check)))
 
 ;;; ------------------------------------------------------------------ parameters
 

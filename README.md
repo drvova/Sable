@@ -48,7 +48,9 @@ that way without Python:
 | Protocol context (claims, packing, domains and sumchecks in a step, LogUp sets) | done (stage 8a) | `zk/proto.py`'s `Ctx`: one scenario, 95 forgeries |
 | The lookup table: its 2^26 rows, the model's value tables, multiplicities, the LogUp table side; public MLEs | done (stage 8b) | `zk/tables.py` and `zk/model.py`: every column and value table equal; `logup.table_side`: one scenario, 172 forgeries |
 | Commitments and GKR at the table's size (2^26 rows) | not yet (stage 8b2) | |
-| Per-layer steps of the model's proof | not yet (stages 8c–8e) | |
+| F_O: the model file, every gadget, the forward pass (dense layers, QK-norm) | done (stage 8c) | `zk/model.py`: all 54 intermediate values of two tiny models' passes equal |
+| Per-layer steps of the model's proof | not yet (stages 8d–8e) | |
+| MoE layers; quantizing a BF16 checkpoint into F_O | not yet | |
 | Prover for whole models | not yet | |
 
 So Exacta cannot yet verify a whole proof of a model. Every protocol that proof is made of is
@@ -202,6 +204,7 @@ The second column names the Sable code that each file reimplements.
 | `exact.lisp` | `round_exact` in `zk/model.py`, mpmath | correctly rounded values: fixed-point exp, ln, sin, cos and sqrt at 320 bits, and Sable's rule for when to use them |
 | `tables.lisp` | `zk/tables.py`, `zk/logup.py`, the table functions of `zk/model.py` | the global lookup table: tags, layout and rows, the model's value tables (`exp-values`, `silu-values`, `samp-values`, `router-values`, `rope-tables`), `build-table`; chunks and `count-lookups`; `table-side`, the table's half of LogUp |
 | `public.lisp` | `zk/mlepub.py` | closed-form MLEs of public vectors: `iota`, `le-low-high`, `lt-const`, `eq-const`, `vocab-indicator` |
+| `model.lisp` | `zk/model.py` | F_O: the model file (`read-model`), the gadgets with their witness values (`requant8`, `normscale`, `shiftq8s`, `qkv-out`, `rope8`, `gshiftround`, `satadd`, `norm-den`, `mulround`, `norm-div`, …), `attention-rows`, `mlp-out`, `layer-forward`, `final-logits`, `forward` |
 | `llm.lisp` | the outer layer of `zk/llm.py`, `zk/proto.py` | the transformer protocol's public side: `make-cfg`, `make-shape`, `column-block-bits`, the commitment layout (`commitment-layout`: groups, packing, merge sets, segments, weight groups; `declare-units`), the policy and its encoding, `check-statement`, `statement`, `sampling-seed`, `weights-digest` (C_W) |
 | `toplevel.lisp` | | the executable: evaluates forms in `exacta-user`; `(help)` |
 
@@ -374,6 +377,27 @@ domain's lookups into two chunks; Sable's `logup.table_side` accepts the proof w
 claims and sums and rejects all 172 forgeries (`test-table-side`, pinned in
 `test-frozen-cases`).
 
+### F_O
+
+The proof is about F_O, an exact integer version of the model: every rounding, normalisation,
+softmax and sampling decision is an integer operation, so each input has exactly one output.
+`model.lisp` holds it gadget by gadget, each returning its output and the witness values the
+prover commits, and signals `witness-error` when an input falls outside F_O's domain (an honest
+prover then refuses to prove).
+
+A model is a file of named integer tensors (`EXACTFO1`): the configuration, the model's exponents
+and shifts, and each layer's int8 weights, per-column exponents, shifts and biases:
+
+    magic "EXACTFO1" | u32 count | entry*
+    entry = u16 name length | name | u8 width (1, 2, 4, 8) | u8 rank | u64 dimension * rank
+            | signed little-endian integers of that width, row-major
+
+`tests/models/` holds two of Sable's quantized tiny models (2 layers, d = 256, 4 heads of 128, a
+vocabulary of 1024): a dense one and a Qwen3-shaped one with QK-norm. On the same tokens, every
+intermediate value of both passes equals Sable's, 54 per model, from the row quantizations to the
+logits (`test-model-forward`). Quantizing a BF16 checkpoint into F_O (Sable's calibration program)
+is not ported yet, so models come from Sable's quantizer.
+
 ### Not done yet
 
 - **The per-layer steps of the model's proof (Sable's `Proto.run`):** the F_O model's domains of
@@ -381,8 +405,9 @@ claims and sums and rejects all 172 forgeries (`test-table-side`, pinned in
   done: the sumcheck, LogUp-GKR, domains, the commitment, the outer layer and the protocol
   context, the lookup table and its side of LogUp. The remaining stages are 8b2 (commitments and
   GKR fast enough for the table's 2^26 rows: today a commitment costs about 6 µs and 2 KB of
-  allocation per element, so the table alone would take most of an hour), 8c (the F_O model's
-  data and per-layer witness), 8d (each unit's steps) and 8e (whole proofs, then MoE). `read-proof-file`
+  allocation per element, so the table alone would take most of an hour), 8d (each unit's steps,
+  with the witness values only the proof needs: attention tiles, lookup histograms) and 8e (whole
+  proofs, then MoE). `read-proof-file`
   parses a real Sable proof, but cannot verify it yet. The reference for this work is Sable's code
   at commit 81807ef. That commit also has `lisp/tests/gpu-trace.py`, which runs Sable's GPU
   prover on a tiny model and records every sub-protocol call of its host verifier, so each step
@@ -441,6 +466,7 @@ exacta-condition
       message-shape-error         a message of the wrong kind or shape
       transcript-exhausted        the proof has too few messages
     invalid-parameter             a value outside a function's domain, or a malformed form
+    witness-error                 an input outside F_O's domain: the honest prover refuses it
     field-division-by-zero        an inverse of zero (also cl:division-by-zero)
 ```
 

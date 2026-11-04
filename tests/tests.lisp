@@ -1308,3 +1308,44 @@ whole 2^26-row table built from them to tables.build_table's, column by column."
   (assert (equal (table-value-fingerprints)
                  '((1397366438 838731675) (1377669541 1092948269) (46828831 101124040)
                    (1818342257 1780444900) (741164168 1772295875) (799026709 234658675)))))
+
+;;; ------------------------------------------------------------------ F_O
+
+(defvar *test-models*
+  (loop for name in '("tiny" "qwen3")
+        collect (cons name (exacta.model:read-model
+                            (asdf:system-relative-pathname "exacta" (format nil "tests/models/~A.exm" name)))))
+  "The test models, read when the tests are loaded (so a saved image holds them): Sable's
+quantized tiny models, a dense one and one with QK-norm (Qwen3-shaped), exported to EXACTFO1.")
+
+(defun model-fingerprints (name)
+  "Fingerprints of each layer's output and of the logits of F_O on tokens from seed 5 (B = 2,
+S = 256), and the greedy argmax of the first 8 rows."
+  (let* ((model (cdr (assoc name *test-models* :test #'string=)))
+         (tokens (let ((state (sb-ext:seed-random-state 5))) (coerce (loop repeat 512 collect (random 1024 state)) 'vector)))
+         (tables (exacta.model:model-tables model 256))
+         (h (exacta.model:embed-tokens model tokens))
+         (out '()))
+    (flet ((flat (m) (make-array (array-total-size m) :element-type (array-element-type m) :displaced-to m)))
+      (loop for layer across (exacta.model:model-layers model)
+            do (setf h (exacta.model:layer-forward model layer h 2 256 tables))
+               (push (fingerprint (flat h)) out))
+      (let ((z (exacta.model:final-logits model h)))
+        (push (fingerprint (flat z)) out)
+        (push (loop for i below 8
+                    collect (loop with best = 0 for j below (array-dimension z 1)
+                                  when (> (aref z i j) (aref z i best)) do (setf best j)
+                                  finally (return best)))
+              out)))
+    (reverse out)))
+
+(defparameter *model-fingerprints*
+  '(("tiny" (385209351 1921462728) (67992394 1468852158) (754246383 125402219) (772 119 774 141 116 979 729 218)) ("qwen3" (104177360 97824691) (329747358 808300888) (1050931097 150939515) (622 30 167 749 802 34 332 622)))
+  "The fingerprints of MODEL-FINGERPRINTS.  Every intermediate value of these passes -- 54 per model:
+the quantizations, NormScale, QKV, RoPE, attention, the output projection, the MLP and the residuals
+of both layers, the logits -- was checked equal to Sable's (model.py, 81807ef, host) on the same
+model files and tokens.")
+
+(defun test-model-forward ()
+  (loop for (name . pins) in *model-fingerprints*
+        do (assert (equal (model-fingerprints name) pins) () "F_O of ~A differs" name)))

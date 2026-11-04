@@ -19,7 +19,7 @@
 
 (defpackage #:exacta-user
   (:use #:cl #:exacta.util #:exacta.conditions #:exacta.field #:exacta.blake3 #:exacta.transcript
-        #:exacta.proofio #:exacta.forms #:exacta.rs #:exacta.sumcheck #:exacta.gkr #:exacta.domain #:exacta.pcs #:exacta.proto #:exacta.exact #:exacta.tables #:exacta.public #:exacta.llm)
+        #:exacta.proofio #:exacta.forms #:exacta.rs #:exacta.sumcheck #:exacta.gkr #:exacta.domain #:exacta.pcs #:exacta.proto #:exacta.exact #:exacta.tables #:exacta.public #:exacta.llm #:exacta.model)
   (:import-from #:exacta.toplevel #:help #:*version*)
   (:documentation "The package in which the executable reads and evaluates forms."))
 
@@ -29,7 +29,7 @@
 
 (defparameter *api-packages*
   '(#:exacta.field #:exacta.forms #:exacta.blake3 #:exacta.transcript #:exacta.proofio #:exacta.rs
-    #:exacta.sumcheck #:exacta.gkr #:exacta.domain #:exacta.pcs #:exacta.proto #:exacta.exact #:exacta.tables #:exacta.public #:exacta.llm #:exacta.conditions #:exacta.util)
+    #:exacta.sumcheck #:exacta.gkr #:exacta.domain #:exacta.pcs #:exacta.proto #:exacta.exact #:exacta.tables #:exacta.public #:exacta.llm #:exacta.model #:exacta.conditions #:exacta.util)
   "The packages whose exported functions make up the API, as HELP lists them.")
 
 ;;; ------------------------------------------------------------------ help
