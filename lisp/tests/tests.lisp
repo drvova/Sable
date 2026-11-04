@@ -1,5 +1,5 @@
 ;;;; tests.lisp -- the port against the Python implementation (vectors.sexp, written by
-;;;; gen-vectors.py), plus the behaviour of the conditions and restarts.
+;;;; gen-vectors.py), forms as data and as code, and the conditions and restarts.
 
 (in-package #:sable.tests)
 
@@ -21,243 +21,297 @@
   "The test vectors, read when the tests are loaded (so a saved image carries them).")
 
 (defun vectors (kind)
-  (loop for v in *vectors* when (eq (first v) kind) collect (rest v)))
+  "The vectors of KIND, as plists; there must be some."
+  (or (loop for v in *vectors* when (eq (first v) kind) collect (rest v))
+      (error "no test vectors of kind ~S" kind)))
 
-(declaim (ftype (function (t) nil) missing-key))
-(defun missing-key (key)
-  (error "a test vector has no ~S" key))
-
-(defmacro do-vectors ((kind &rest keys) &body body)
-  "Run BODY for each vector of KIND, with each of KEYS bound to the value of the same-named
-keyword; check that there is at least one."
-  (let ((vector (gensym "VECTOR")))
-    `(progn
-       (check (vectors ,kind) "no vectors of kind ~S" ,kind)
-       (dolist (,vector (vectors ,kind))
-         (destructuring-bind (&key ,@(mapcar (lambda (k) `(,k (missing-key ',k))) keys)
-                              &allow-other-keys)
-             ,vector
-           (declare (ignorable ,@keys))
-           ,@body)))))
+(defun each-vector (kind function)
+  "Apply FUNCTION to the keyword arguments of each vector of KIND."
+  (dolist (v (vectors kind))
+    (apply function v)))
 
 (defun e (list) (coerce-ext list))
 (defun exts (lists) (map 'vector #'e lists))
 (defun same (ext list) (equal (coerce ext 'list) list))
+(defun lists (exts) (map 'list (lambda (x) (coerce x 'list)) exts))
+
+(defun symbols (prefix n)
+  "PREFIX0 .. PREFIX(n-1), interned here: column or table variables."
+  (loop for i below n collect (intern (format nil "~A~D" prefix i) '#:sable.tests)))
 
 ;;; ------------------------------------------------------------------ field
 
-(deftest field-tower
-  (check (check-tower))
-  (do-vectors (:pow a e res)
-    (check (= (fpow a e) res)))
-  (do-vectors (:ext a b add sub mul inv eq1)
-    (let ((a (e a)) (b (e b)))
-      (check (same (ext+ a b) add))
-      (check (same (ext- a b) sub))
-      (check (same (ext* a b) mul))
-      (check (same (ext-inv a) inv))
-      (check (ext= (ext* a (ext-inv a)) (ext-one (length a))))
-      (check (same (ext-eq1 a b) eq1)))))
+(defun test-field-tower ()
+  (assert (check-tower))
+  (each-vector :pow (lambda (&key a e res) (assert (= (fpow a e) res))))
+  (each-vector :ext
+               (lambda (&key a b add sub mul inv eq1 &allow-other-keys)
+                 (let ((a (e a)) (b (e b)))
+                   (assert (same (ext+ a b) add))
+                   (assert (same (ext- a b) sub))
+                   (assert (same (ext* a b) mul))
+                   (assert (same (ext-inv a) inv))
+                   (assert (same (ext-eq1 a b) eq1))))))
 
-(deftest field-multilinear
-  (do-vectors (:lagrange vals x res)
-    (check (same (lagrange (exts vals) (e x)) res)))
-  (do-vectors (:eq d a b res)
-    (check (same (ext-eq (exts a) (exts b) d) res)))
-  (do-vectors (:mle d r eqtab base base-res ext ext-res)
-    (let ((r (exts r)))
-      (check (equalp (map 'list (lambda (x) (coerce x 'list)) (eq-table r d)) eqtab))
-      (check (same (mle-eval (coerce base 'vector) r d) base-res))
-      (check (same (mle-eval (exts ext) r d) ext-res)))))
+(defun test-field-tower-is-code ()
+  ;; the code behind EXT* is a form that can be read ...
+  (let ((code (tower-code 'mul* 4)))
+    (assert (eq (first code) 'lambda))
+    (assert (equal (second code) '(sable.field::a sable.field::b))))
+  ;; ... and any power-of-two degree works, though only 4 and 8 are used (16 works too, but
+  ;; its 4,600-cons inverse takes seconds to compile)
+  (let ((state (sb-ext:seed-random-state 7)))
+    (dolist (d '(2 4 8))
+      (let ((a (coerce-ext (loop repeat d collect (random +p+ state)))))
+        (assert (ext= (ext* a (ext-inv a)) (ext-one d)))
+        (assert (ext= (ext-expt a 3) (ext* a (ext* a a))))))))
 
-(deftest field-inverse-of-zero
+(defun test-field-multilinear ()
+  (each-vector :lagrange
+               (lambda (&key vals x res &allow-other-keys)
+                 (assert (same (lagrange (exts vals) (e x)) res))))
+  (each-vector :eq
+               (lambda (&key d a b res)
+                 (assert (same (ext-eq (exts a) (exts b) d) res))))
+  (each-vector :mle
+               (lambda (&key d r eqtab base base-res ext ext-res)
+                 (let ((r (exts r)))
+                   (assert (equal (lists (eq-table r d)) eqtab))
+                   (assert (same (mle-eval base r d) base-res))
+                   (assert (same (mle-eval (exts ext) r d) ext-res))))))
+
+(defun test-field-inverse-of-zero ()
   ;; no handler: the error, a DIVISION-BY-ZERO as well as a SABLE-ERROR
-  (let ((c (check-signals field-division-by-zero (finv 0))))
-    (check (typep c 'division-by-zero))
-    (check (typep c 'sable-error)))
+  (let ((c (signalled 'field-division-by-zero (lambda () (finv 0)))))
+    (assert (typep c 'division-by-zero))
+    (assert (typep c 'sable-error)))
   ;; the restarts: RETURN-ZERO (the Python convention) and USE-VALUE
-  (check (= 0 (handler-bind ((field-division-by-zero #'return-zero)) (finv 0))))
-  (check (= 7 (handler-bind ((field-division-by-zero (lambda (c) (use-value 7 c)))) (finv +p+))))
-  (check (every #'zerop (handler-bind ((field-division-by-zero #'return-zero)) (ext-inv (make-ext 8)))))
-  (check (= 5 (finv (finv 5)))))
+  (assert (= 0 (handler-bind ((field-division-by-zero #'return-zero)) (finv 0))))
+  (assert (= 7 (handler-bind ((field-division-by-zero (lambda (c) (use-value 7 c)))) (finv +p+))))
+  (assert (every #'zerop (handler-bind ((field-division-by-zero #'return-zero))
+                           (ext-inv (make-ext 8))))))
 
-(deftest invalid-parameter-restart
-  (check-signals invalid-parameter (sable.rs:root-of-unity 30))
-  (check (= (sable.rs:root-of-unity 3)
-            (handler-bind ((invalid-parameter (lambda (c) (use-value 3 c))))
-              (sable.rs:root-of-unity 30))))
-  (check-signals invalid-parameter (make-transcript "x" 5)))
+(defun test-invalid-parameter-restart ()
+  (assert (signalled 'invalid-parameter (lambda () (sable.rs:root-of-unity 30))))
+  (assert (= (sable.rs:root-of-unity 3)
+             (handler-bind ((invalid-parameter (lambda (c) (use-value 3 c))))
+               (sable.rs:root-of-unity 30))))
+  (assert (signalled 'invalid-parameter (lambda () (make-transcript "x" 5)))))
+
+;;; ------------------------------------------------------------------ forms
+
+(defun test-forms-against-python ()
+  ;; zk/poly.py's  (x + 3) (y - x) z + 7 - x^2  over columns 0, 1, 2
+  (destructuring-bind (c0 c1 c2) (symbols "C" 3)
+    (let ((form `(- (+ (* (+ ,c0 3) (- ,c1 ,c0) ,c2) 7) (expt ,c0 2)))
+          (values `((,c0 . 11) (,c1 . ,(- +p+ 5)) (,c2 . ,(expt 2 30)))))
+      (each-vector :poly
+                   (lambda (&key eval degree vars const terms)
+                     ;; the same polynomial as Python's term dictionary
+                     (assert (form= form `(+ ,@(loop for (ids c) in terms
+                                                     collect `(* ,c ,@(mapcar (lambda (i) (nth i (list c0 c1 c2))) ids))))))
+                     (assert (= (evaluate form values) eval))
+                     (assert (= (form-degree form) degree))
+                     (assert (equal (form-variables form) (mapcar (lambda (i) (nth i (list c0 c1 c2))) vars)))
+                     (assert (= (constant-term form) const))))
+      ;; normalising is idempotent and keeps the polynomial
+      (let ((normal (normalize form)))
+        (assert (form= normal form))
+        (assert (equal (normalize normal) normal)))
+      ;; renaming is SUBLIS
+      (let ((swapped (sublis `((,c0 . ,c2) (,c2 . ,c0)) form)))
+        (assert (= (evaluate swapped `((,c0 . ,(expt 2 30)) (,c1 . ,(- +p+ 5)) (,c2 . 11)))
+                   (evaluate form values)))))))
+
+(defun test-forms-as-code ()
+  (assert (equal (normalize '(* (+ a 1) (- a 1))) '(+ -1 (* a a))))
+  (assert (equal (normalize '(- (* 2 x) x x)) 0))
+  (assert (= (form-degree '(* (+ alpha t0) t1 t1) '(t0 t1)) 3))
+  ;; over F_p^8, a form computes what the field functions do
+  (let ((a (coerce-ext '(1 2 3 4 5 6 7 8)))
+        (b (coerce-ext '(9 10 11 12 13 14 15 16))))
+    (assert (ext= (evaluate '(+ (* a b) 1 (- b)) `((a . ,a) (b . ,b)) :degree 8)
+                  (ext- (ext+ (ext* a b) (ext-one 8)) b)))
+    (assert (equal (arithmetic-form '(* a (expt b 2)) :degree 8) '(ext* a (ext-expt b 2)))))
+  (assert (signalled 'invalid-parameter (lambda () (expand '(/ a b)))))
+  (assert (signalled 'invalid-parameter (lambda () (compile-form '(* a b) '(a))))))
 
 ;;; ------------------------------------------------------------------ BLAKE3 and the transcript
 
-(deftest blake3-standard
-  (do-vectors (:blake3 input digest xof)
-    (let ((in (hex input)))
-      (check (equalp (blake3-hash in) (hex digest)) "~D-byte input" (length in))
-      (check (equalp (blake3-hash in 131) (hex xof)))
-      ;; incremental updates in odd pieces give the same digest
-      (let ((h (make-blake3)))
-        (loop for s from 0 below (length in) by 333
-              do (blake3-update h in :start s :end (min (length in) (+ s 333))))
-        (check (equalp (blake3-digest h) (hex digest)))))))
+(defun test-blake3-standard ()
+  (each-vector :blake3
+               (lambda (&key input digest xof)
+                 (let ((in (hex input)))
+                   (assert (equalp (blake3-hash in) (hex digest)))
+                   (assert (equalp (blake3-hash in 131) (hex xof)))
+                   ;; incremental updates in odd pieces give the same digest
+                   (let ((h (make-blake3)))
+                     (loop for s from 0 below (length in) by 333
+                           do (blake3-update h in :start s :end (min (length in) (+ s 333))))
+                     (assert (equalp (blake3-digest h) (hex digest))))))))
 
-(deftest blake3-sequential
-  (do-vectors (:b3s chunks digest xof)
-    (let ((s (make-b3s)))
-      (dolist (c chunks) (b3s-update s (hex c)))
-      (check (equalp (b3s-digest s 32) (hex digest)))
-      (check (equalp (b3s-digest (b3s-copy s) 200) (hex xof))))))
+(defun test-blake3-sequential ()
+  (each-vector :b3s
+               (lambda (&key chunks digest xof)
+                 (let ((s (make-b3s)))
+                   (dolist (c chunks) (b3s-update s (hex c)))
+                   (assert (equalp (b3s-digest s 32) (hex digest)))
+                   (assert (equalp (b3s-digest (b3s-copy s) 200) (hex xof)))))))
 
-(deftest transcript-replay
-  (do-vectors (:transcript label ops)
-    (let ((tr (make-transcript (hex label) 8)))
-      (dolist (op ops)
-        (destructuring-bind (kind &rest args) op
-          (cond ((string= kind "absorb") (absorb tr (hex (first args))))
-                ((string= kind "absorb-ext")
-                 (absorb tr (message-octets (to-field-array (first args)))))
-                ((string= kind "challenge-base")
-                 (check (equal (challenge-base tr (first args)) (second args))))
-                ((string= kind "challenge")
-                 (check (same (challenge tr (first args)) (second args))))
-                ((string= kind "challenge-bits")
-                 (check (equal (challenge-bits tr (first args) (second args)) (third args))))
-                ((string= kind "digest")
-                 (check (equalp (b3s-digest (transcript-state tr) 32) (hex (first args)))))
-                (t (check nil "unknown op ~S" kind)))))))
-  (do-vectors (:grind base bits nonce ok)
-    (check (eq ok (check-grind (hex base) nonce bits))))
-  (do-vectors (:label-name name res)
-    (check (string= (label-name name) res) "~S -> ~S" name (label-name name))))
+(defun test-transcript-replay ()
+  (each-vector :transcript
+               (lambda (&key label ops)
+                 (let ((tr (make-transcript (hex label) 8)))
+                   (loop for (kind . args) in ops
+                         do (cond ((string= kind "absorb") (absorb tr (hex (first args))))
+                                  ((string= kind "absorb-ext")
+                                   (absorb tr (message-octets (to-field-array (first args)))))
+                                  ((string= kind "challenge-base")
+                                   (assert (equal (challenge-base tr (first args)) (second args))))
+                                  ((string= kind "challenge")
+                                   (assert (same (challenge tr (first args)) (second args))))
+                                  ((string= kind "challenge-bits")
+                                   (assert (equal (challenge-bits tr (first args) (second args)) (third args))))
+                                  ((string= kind "digest")
+                                   (assert (equalp (b3s-digest (transcript-state tr) 32) (hex (first args)))))
+                                  (t (error "unknown transcript op ~S" kind)))))))
+  (each-vector :grind
+               (lambda (&key base bits nonce ok)
+                 (assert (eq ok (check-grind (hex base) nonce bits)))))
+  (each-vector :label-name
+               (lambda (&key name res)
+                 (assert (string= (label-name name) res)))))
 
-(deftest transcript-grind-roundtrip
+(defun test-transcript-grind-roundtrip ()
   (let* ((p (make-transcript "pow" 4))
          (nonce (grind p 6))
          (v (make-transcript "pow" 4 :messages (transcript-messages p))))
-    (check (= nonce (verify-grind v 6)))
-    (check (transcript-finished-p v))
+    (assert (= nonce (verify-grind v 6)))
+    (assert (transcript-finished-p v))
     ;; a nonce that does not meet the bound is rejected
-    (let* ((bad (copy-seq (aref (transcript-messages p) 0))))
+    (let ((bad (copy-seq (aref (transcript-messages p) 0))))
       (setf (aref bad 0) (logxor (aref bad 0) 1))
-      (unless (check-grind (b3s-digest (transcript-state (make-transcript "pow" 4)) 32)
-                           (le-integer bad) 6)
-        (check-signals verification-failure
-                       (verify-grind (make-transcript "pow" 4 :messages (list bad)) 6))))))
+      (unless (check-grind (b3s-digest (transcript-state (make-transcript "pow" 4)) 32) (le-integer bad) 6)
+        (assert (signalled 'verification-failure
+                           (lambda () (verify-grind (make-transcript "pow" 4 :messages (list bad)) 6))))))))
 
 ;;; ------------------------------------------------------------------ proof bytes
 
-(deftest proofio-roundtrip
-  (do-vectors (:proofio bytes msgs)
-    (let* ((b (hex bytes))
-           (parsed (sable.proofio:decode-proof b)))
-      (check (= (length parsed) (length msgs)))
-      (loop for m across parsed
-            for (kind . spec) in msgs
-            do (if (string= kind "bytes")
-                   (check (equalp m (hex (first spec))))
-                   (progn (check (equal (array-dimensions m) (first spec)))
-                          (check (equal (loop for i below (array-total-size m) collect (row-major-aref m i))
-                                        (second spec))))))
-      (check (equalp (sable.proofio:encode-proof parsed) b)))))
+(defun test-proofio-roundtrip ()
+  (each-vector :proofio
+               (lambda (&key bytes msgs)
+                 (let ((parsed (sable.proofio:decode-proof (hex bytes))))
+                   (assert (= (length parsed) (length msgs)))
+                   (loop for m across parsed
+                         for (kind . spec) in msgs
+                         do (if (string= kind "bytes")
+                                (assert (equalp m (hex (first spec))))
+                                (progn
+                                  (assert (equal (array-dimensions m) (first spec)))
+                                  (assert (equal (loop for i below (array-total-size m)
+                                                       collect (row-major-aref m i))
+                                                 (second spec))))))
+                   (assert (equalp (sable.proofio:encode-proof parsed) (hex bytes)))))))
 
-(deftest proofio-rejects-malformed
+(defun test-proofio-rejects-malformed ()
   (let ((reasons '(("magic" . :magic) ("truncated" . :truncated) ("trailing" . :trailing-bytes)
                    ("tag" . :unknown-tag) ("range" . :value-range) ("rank" . :rank)
                    ;; zk/proofio.py rejects this one only through numpy's reshape (its np.prod of
                    ;; the shape wraps to 0); the exact product here exceeds the input
                    ("huge" . :truncated))))
-    (do-vectors (:proofio-bad why bytes)
-      (let ((c (check-signals malformed-proof (sable.proofio:decode-proof (hex bytes)))))
-        (check (eq (malformed-proof-reason c) (cdr (assoc why reasons :test #'string=)))
-               "~A: got ~S (~A)" why (malformed-proof-reason c) c)))))
+    (each-vector :proofio-bad
+                 (lambda (&key why bytes &allow-other-keys)
+                   (let ((c (signalled 'malformed-proof
+                                       (lambda () (sable.proofio:decode-proof (hex bytes))))))
+                     (assert (eq (malformed-proof-reason c) (cdr (assoc why reasons :test #'string=)))))))))
 
-;;; ------------------------------------------------------------------ polynomials, Reed-Solomon
+;;; ------------------------------------------------------------------ Reed-Solomon
 
-(deftest poly-arithmetic
-  (do-vectors (:poly eval degree vars const terms)
-    (let* ((x (sable.poly:poly-var 0)) (y (sable.poly:poly-var 1)) (z (sable.poly:poly-var 2))
-           (p (sable.poly:poly- (sable.poly:poly+ (sable.poly:poly* (sable.poly:poly+ x 3)
-                                                                    (sable.poly:poly- y x) z)
-                                                  7)
-                                (sable.poly:poly-expt x 2)))
-           (vals (vector 11 (- +p+ 5) (ash 1 30))))
-      (check (= (sable.poly:poly-eval p vals) eval))
-      (check (= (sable.poly:poly-degree p) degree))
-      (check (equal (sable.poly:poly-vars p) vars))
-      (check (= (sable.poly:poly-const-term p) const))
-      (check (sable.poly:poly= p (sable.poly:make-poly (mapcar (lambda (kv) (cons (first kv) (second kv)))
-                                                               terms))))
-      (check (sable.poly:poly= (sable.poly:poly-rename p (lambda (i) (- 2 i)))
-                               (sable.poly:poly-rename (sable.poly:poly-rename p (lambda (i) i))
-                                                       '((0 . 2) (1 . 1) (2 . 0)))))
-      (check (equal (sable.poly:poly-vars (sable.poly:lparam "Dyn")) '(-3))))))
-
-(deftest reed-solomon
-  (do-vectors (:rs-encode n root msg cw points tw)
-    (check (= (sable.rs:root-of-unity n) root))
-    (check (equal (coerce (sable.rs:domain-points n) 'list) points))
-    (check (equal (map 'list (lambda (v) (coerce v 'list)) (sable.rs:twiddles n)) tw))
-    (check (equal (coerce (sable.rs:encode msg n) 'list) cw))
-    (check (equal (coerce (sable.rs:brute-eval msg n) 'list) cw)))
-  (do-vectors (:rs-fold n cw r res)
-    (let ((folded (sable.rs:fold (exts cw) (aref (sable.rs:twiddles n) 0) (e r))))
-      (check (equal (map 'list (lambda (v) (coerce v 'list)) folded) res)))))
+(defun test-reed-solomon ()
+  (each-vector :rs-encode
+               (lambda (&key n root msg cw points tw)
+                 (assert (= (sable.rs:root-of-unity n) root))
+                 (assert (equal (coerce (sable.rs:domain-points n) 'list) points))
+                 (assert (equal (lists (sable.rs:twiddles n)) tw))
+                 (assert (equal (coerce (sable.rs:encode msg n) 'list) cw))
+                 (assert (equal (coerce (sable.rs:brute-eval msg n) 'list) cw))))
+  (each-vector :rs-fold
+               (lambda (&key n cw r res)
+                 (assert (equal (lists (sable.rs:fold (exts cw) (aref (sable.rs:twiddles n) 0) (e r)))
+                                res)))))
 
 ;;; ------------------------------------------------------------------ sumcheck
 
-(deftest sumcheck-against-python
-  (do-vectors (:sumcheck d n tables eq-r claim proof rho reduced finals)
-    (let* ((msgs (sable.proofio:decode-proof (hex proof)))
-           (eq-r (and eq-r (exts eq-r)))
-           (tr (make-transcript "sc-vec" d :messages msgs)))
-      ;; the verifier on the Python prover's proof
-      (multiple-value-bind (vrho vred) (sable.sumcheck:verify tr n (length tables) (e claim) :eq-r eq-r)
-        (check (equal (map 'list (lambda (v) (coerce v 'list)) vrho) rho))
-        (check (same vred reduced))
-        (check (sable.sumcheck:check-reduced vred (reduce #'ext* (exts finals))))
-        (check (transcript-finished-p tr)))
-      ;; the Lisp prover writes the same bytes as the Python prover
-      (let ((ptr (make-transcript "sc-vec" d))
-            (tabs (mapcar #'exts tables)))
-        (check (same (sable.sumcheck:product-claim tabs n d :eq-r eq-r) claim))
-        (multiple-value-bind (prho pfinals) (sable.sumcheck:prove-product ptr n tabs :eq-r eq-r)
-          (check (equal (map 'list (lambda (v) (coerce v 'list)) prho) rho))
-          (check (equal (mapcar (lambda (v) (coerce v 'list)) pfinals) finals))
-          (check (equalp (sable.proofio:encode-proof (transcript-messages ptr)) (hex proof))))))))
+(defun sumcheck-case (&key d n tables eq-r claim proof rho reduced finals)
+  "A sumcheck vector as the statement (* t0 t1 ...), its tables and finals as alists."
+  (let ((variables (symbols "T" (length tables))))
+    (list :d d :n n :claim (e claim) :proof (hex proof) :rho rho :reduced reduced
+          :statement `(* ,@variables)
+          :eq (and eq-r (exts eq-r))
+          :tables (mapcar (lambda (v table) (cons v (exts table))) variables tables)
+          :finals (mapcar (lambda (v final) (cons v (e final))) variables finals))))
 
-(deftest sumcheck-rejects-forgeries
-  (let* ((v (first (vectors :sumcheck)))
-         (d (getf v :d)) (n (getf v :n)) (ntab (length (getf v :tables)))
-         (claim (e (getf v :claim)))
-         (finals (exts (getf v :finals))))
-    (flet ((run (msgs &optional (claim claim))
-             (let ((tr (make-transcript "sc-vec" d :messages msgs)))
-               (multiple-value-bind (rho red) (sable.sumcheck:verify tr n ntab claim)
-                 (declare (ignore rho))
-                 (sable.sumcheck:check-reduced red (reduce #'ext* finals))))))
-      (let ((good (sable.proofio:decode-proof (hex (getf v :proof)))))
-        (check (run good))
-        ;; a wrong claim
-        (check-signals verification-failure (run good (ext+ claim (ext-one d))))
-        ;; each round message changed in one coordinate
-        (dotimes (j n)
-          (let ((msgs (sable.proofio:decode-proof (hex (getf v :proof)))))
-            (setf (aref (aref msgs j) 0 1) (fadd (aref (aref msgs j) 0 1) 1))
-            (check-signals verification-failure (run msgs))))
-        ;; a message of the wrong shape, and a missing one
-        (let ((msgs (copy-seq good)))
-          (setf (aref msgs 0) (make-array (list 1 d) :element-type '(unsigned-byte 32) :initial-element 0))
-          (check (typep (check-signals message-shape-error (run msgs)) 'verification-failure)))
-        (check-signals transcript-exhausted (run (subseq good 0 (1- n))))
-        (let ((msgs (copy-seq good)))
-          (setf (aref msgs 0) (make-octets 4))
-          (check-signals message-shape-error (run msgs)))))))
+(defun test-sumcheck-against-python ()
+  (each-vector :sumcheck
+               (lambda (&rest vector)
+                 (destructuring-bind (&key d n claim proof rho reduced statement eq tables finals)
+                     (apply #'sumcheck-case vector)
+                   ;; the verifier on the Python prover's proof
+                   (let ((tr (make-transcript "sc-vec" d :messages (sable.proofio:decode-proof proof))))
+                     (multiple-value-bind (vrho vreduced) (sable.sumcheck:verify tr n statement claim :eq eq)
+                       (assert (equal (lists vrho) rho))
+                       (assert (same vreduced reduced))
+                       (assert (sable.sumcheck:check-final vreduced statement finals))
+                       (assert (transcript-finished-p tr))))
+                   ;; the Lisp prover writes the same bytes as the Python prover
+                   (let ((tr (make-transcript "sc-vec" d)))
+                     (assert (ext= (sable.sumcheck:hypercube-sum statement n tables d :eq eq) claim))
+                     (multiple-value-bind (prho pfinals) (sable.sumcheck:prove tr n statement tables :eq eq)
+                       (assert (equal (lists prho) rho))
+                       (assert (equalp pfinals finals))
+                       (assert (equalp (sable.proofio:encode-proof (transcript-messages tr)) proof))))))))
 
-(deftest eval-terms-matches-product
-  (let* ((d 8)
-         (fs (list (vector (e '(1 2 3 4 5 6 7 8)) (e '(9 9 9 9 9 9 9 9)))
-                   (vector (e '(3 0 0 0 0 0 0 0)))))
-         (c (ext-one d)))
-    ;; sum_b f0[b] * f1[0]
-    (check (ext= (sable.sumcheck:eval-terms (list (list* c '(0 1))) fs d)
-                 (ext* (ext+ (aref (first fs) 0) (aref (first fs) 1)) (aref (second fs) 0))))))
+(defun test-sumcheck-rejects-forgeries ()
+  (destructuring-bind (&key d n claim proof statement finals &allow-other-keys)
+      (apply #'sumcheck-case (first (vectors :sumcheck)))
+    (flet ((run (messages &optional (claim claim))
+             (let ((tr (make-transcript "sc-vec" d :messages messages)))
+               (sable.sumcheck:check-final (nth-value 1 (sable.sumcheck:verify tr n statement claim))
+                                           statement finals)))
+           (rejected (type thunk)
+             (assert (signalled type thunk))))
+      (assert (run (sable.proofio:decode-proof proof)))
+      ;; a wrong claim
+      (rejected 'verification-failure
+                (lambda () (run (sable.proofio:decode-proof proof) (ext+ claim (ext-one d)))))
+      ;; each round message changed in one coordinate
+      (dotimes (j n)
+        (let ((messages (sable.proofio:decode-proof proof)))
+          (setf (aref (aref messages j) 0 1) (fadd (aref (aref messages j) 0 1) 1))
+          (rejected 'verification-failure (lambda () (run messages)))))
+      ;; a message of the wrong shape or kind, and a missing one
+      (let ((messages (sable.proofio:decode-proof proof)))
+        (setf (aref messages 0) (make-array (list 1 d) :element-type '(unsigned-byte 32) :initial-element 0))
+        (rejected 'message-shape-error (lambda () (run messages)))
+        (setf (aref messages 0) (make-octets 4))
+        (rejected 'message-shape-error (lambda () (run messages))))
+      (rejected 'transcript-exhausted
+                (lambda () (run (subseq (sable.proofio:decode-proof proof) 0 (1- n))))))))
+
+(defun test-sumcheck-of-any-statement ()
+  ;; a statement that is not a plain product, with a constant (a challenge) beside the tables
+  (let* ((d 4) (n 3)
+         (statement '(+ (* alpha t0 t1) (* 3 t1) -2))
+         (state (sb-ext:seed-random-state 3))
+         (random-ext (lambda () (coerce-ext (loop repeat d collect (random +p+ state)))))
+         (constants `((alpha . ,(funcall random-ext))))
+         (tables (loop for v in '(t0 t1)
+                       collect (cons v (coerce (loop repeat (expt 2 n) collect (funcall random-ext)) 'vector))))
+         (claim (sable.sumcheck:hypercube-sum statement n tables d :constants constants))
+         (prover (make-transcript "any" d))
+         (finals (nth-value 1 (sable.sumcheck:prove prover n statement tables :constants constants)))
+         (verifier (make-transcript "any" d :messages (transcript-messages prover))))
+    (assert (= (sable.sumcheck:statement-degree statement constants) 2))
+    (assert (sable.sumcheck:check-final
+             (nth-value 1 (sable.sumcheck:verify verifier n statement claim :constants constants))
+             statement finals :constants constants))))

@@ -1,44 +1,31 @@
-;;;; framework.lisp -- a small test harness built on the condition system (no dependencies).
+;;;; framework.lisp -- running the tests, on the condition system (no dependencies).
 ;;;;
-;;;; Each test runs inside RESTART-CASE with the restarts SKIP-TEST and RETRY-TEST.  RUN-TESTS
-;;;; binds a handler (HANDLER-BIND, so the stack is still intact) that records the failure and
-;;;; invokes SKIP-TEST; with :DEBUG T it declines instead, so the debugger comes up with SKIP-TEST,
-;;;; RETRY-TEST and ABORT-TESTS on offer.  CHECK signals TEST-FAILURE, a condition of its own, so a
-;;;; failed expectation and an unexpected error are reported differently.
+;;;; A test is any function whose name starts with TEST- in SABLE.TESTS; its checks are ASSERT
+;;;; forms.  Each runs inside RESTART-CASE with the restarts SKIP-TEST and RETRY-TEST.  RUN-TESTS
+;;;; binds a handler (HANDLER-BIND, so the stack is still intact) that records a failure and
+;;;; invokes SKIP-TEST; with :DEBUG T it declines, so the debugger comes up with SKIP-TEST,
+;;;; RETRY-TEST and ABORT-TESTS on offer.
 
 (defpackage #:sable.tests
-  (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.blake3 #:sable.transcript)
-  (:export #:run-tests #:deftest #:check #:check-signals #:*tests*))
+  (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.forms #:sable.blake3
+        #:sable.transcript)
+  (:export #:run-tests #:all-tests #:signalled))
 
 (in-package #:sable.tests)
 
-(defvar *tests* '() "Test names, in definition order (reversed).")
+(defun all-tests ()
+  "The tests: the functions of this package named TEST-..., sorted."
+  (sort (loop for symbol being the present-symbols of '#:sable.tests
+              when (and (fboundp symbol) (eql 0 (search "TEST-" (symbol-name symbol))))
+                collect symbol)
+        #'string<))
 
-(define-condition test-failure (error)
-  ((form :initarg :form :reader test-failure-form)
-   (detail :initarg :detail :initform nil :reader test-failure-detail))
-  (:report (lambda (c s)
-             (format s "~S failed~@[: ~A~]" (test-failure-form c) (test-failure-detail c)))))
-
-(defmacro check (form &optional detail &rest args)
-  "Signal TEST-FAILURE unless FORM is true; DETAIL is a format control for ARGS."
-  `(unless ,form
-     (error 'test-failure :form ',form :detail ,(and detail `(format nil ,detail ,@args)))))
-
-(defmacro check-signals (type form)
-  "Check that FORM signals a condition of TYPE (via ERROR or SIGNAL); return the condition."
-  (let ((c (gensym "C")))
-    `(let ((,c (handler-case (progn ,form nil)
-                 (,type (,c) ,c))))
-       (unless ,c
-         (error 'test-failure :form ',form :detail ,(format nil "no ~S signalled" type)))
-       ,c)))
-
-(defmacro deftest (name &body body)
-  `(progn
-     (defun ,name () ,@body)
-     (pushnew ',name *tests*)
-     ',name))
+(defun signalled (type thunk)
+  "The condition of TYPE that calling THUNK signals, or NIL if THUNK returns without one."
+  (block nil
+    (handler-bind ((condition (lambda (c) (when (typep c type) (return c)))))
+      (funcall thunk)
+      nil)))
 
 (defun run-test (name)
   "Run one test; returns T on success.  Restarts: SKIP-TEST, RETRY-TEST."
@@ -50,10 +37,10 @@
       (retry-test ()
         :report (lambda (s) (format s "Run the test ~S again." name))))))
 
-(defun run-tests (&key (tests (reverse *tests*)) debug (stream *standard-output*))
-  "Run TESTS; report and return true when all pass.  With DEBUG, failures enter the debugger."
+(defun run-tests (&key (tests (all-tests)) debug (stream *standard-output*))
+  "Run TESTS; report, and return true when all pass.  With DEBUG, failures enter the debugger."
   (let ((failed '()) (passed 0)
-        (t0 (get-internal-real-time)))
+        (start (get-internal-real-time)))
     (restart-case
         (dolist (name tests)
           (handler-bind ((error (lambda (c)
@@ -70,5 +57,5 @@
         :report "Stop running tests."
         nil))
     (format stream "~&~D passed, ~D failed (~,2F s)~%" passed (length failed)
-            (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
+            (/ (- (get-internal-real-time) start) internal-time-units-per-second))
     (null failed)))

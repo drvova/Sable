@@ -8,16 +8,21 @@
 ;;;; A base element is an integer in [0, p).  An extension element is an EXT, a vector of D
 ;;;; coordinates in the tower order of zk/field.py: its first half is the constant term and its
 ;;;; second half the coefficient of the top generator (z for F_p8, y for F_p4, x for F_p2), so
-;;;; each level is a pair of elements of the level below.  Multiplication and inversion are
-;;;; written once, recursively over the levels, and expanded by a macro into straight-line code
-;;;; for each degree (DEFINE-TOWER-FUNCTION).  The functions return fresh EXTs and never modify
-;;;; their arguments.
+;;;; each level is a pair of elements of the level below.
+;;;;
+;;;; Multiplication and inversion are written once, recursively over the levels, as functions on
+;;;; symbolic coordinates (MUL*, INV*).  TOWER-CODE runs them on the coordinates of the arguments
+;;;; and returns the resulting LAMBDA form, straight-line fixnum code for one degree;
+;;;; TOWER-FUNCTION compiles it on first use.  So any power-of-two degree works, and the code
+;;;; behind EXT* can be read: (tower-code 'mul* 4).  The functions return fresh EXTs and never
+;;;; modify their arguments.
 
 (defpackage #:sable.field
   (:use #:cl #:sable.conditions)
   (:export #:+p+ #:+nonres+ #:fp #:modp #:fadd #:fsub #:fneg #:fmul #:fpow #:finv #:to-signed
            #:ext #:degree #:check-degree #:make-ext #:coerce-ext #:ext-one #:base->ext #:embed
            #:ext= #:ext+ #:ext- #:ext-neg #:ext* #:ext-scale #:ext-inv #:ext-expt
+           #:mul* #:inv* #:tower-code #:tower-function
            #:ext-eq1 #:ext-eq #:ext-dot #:lagrange #:eq-table #:fold-table #:mle-eval #:check-tower))
 
 (in-package #:sable.field)
@@ -116,87 +121,96 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
 ;;; ------------------------------------------------------------------ arithmetic
 
 (defun ext= (a b) (equalp a b))
-;; Elementwise operations.
-(macrolet ((define-elementwise (name lambda-list function documentation)
-             `(defun ,name ,lambda-list
-                ,documentation
-                (declare (type ext ,@lambda-list) (optimize speed))
-                (map 'ext ,function ,@lambda-list))))
-  (define-elementwise ext+ (a b) #'fadd "A + B.")
-  (define-elementwise ext- (a b) #'fsub "A - B.")
-  (define-elementwise ext-neg (a) #'fneg "-A."))
+;; Elementwise operations.  With the types declared, SBCL open-codes the MAPs.
+
+(defun ext+ (a b)
+  "A + B."
+  (declare (type ext a b) (optimize speed))
+  (map 'ext #'fadd a b))
+
+(defun ext- (a b)
+  "A - B."
+  (declare (type ext a b) (optimize speed))
+  (map 'ext #'fsub a b))
+
+(defun ext-neg (a)
+  "-A."
+  (declare (type ext a) (optimize speed))
+  (map 'ext #'fneg a))
 
 (defun ext-scale (a s)
   "A times the base element S."
-  (declare (type ext a))
+  (declare (type ext a) (optimize speed))
   (let ((s (modp s)))
+    (declare (type fp s))
     (map 'ext (lambda (x) (fmul x s)) a)))
 
-;;; The tower operations are defined once, recursively, on symbolic coordinates: lists of forms,
-;;; one per coordinate.  Each level is a pair (A0, A1) = A0 + A1 w of elements of the level below,
-;;; where w is the level's generator (x in F_p2, y in F_p4, z in F_p8) and w^2 is the generator of
-;;; the level below (3 in F_p).  DEFINE-TOWER-FUNCTION expands the recursion at compile time into
-;;; straight-line fixnum code for one degree, with every intermediate value bound once.
+;;; The tower, on symbolic coordinates: an element is a list of forms, one per coordinate.  Each
+;;; level is a pair (A0, A1) = A0 + A1 w of elements of the level below, where w is the level's
+;;; generator (x in F_p2, y in F_p4, z in F_p8) and w^2 the generator of the level below (3 in F_p).
+;;; Intermediate values are bound once, as they are produced (BIND).
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *bindings* '()
-    "The bindings (variable form) of the symbolic computation being expanded, most recent first.")
+(defvar *bindings* '()
+  "The bindings (variable form) of the symbolic computation in progress, most recent first.")
 
-  (defun bind (coordinates)
-    "Bind each coordinate form to a fresh variable; return the variables."
-    (loop for form in coordinates
-          collect (let ((variable (gensym "C")))
-                    (push (list variable form) *bindings*)
-                    variable)))
+(defun bind (coordinates)
+  "Bind each coordinate form to a fresh variable; return the variables."
+  (loop for form in coordinates
+        collect (let ((variable (gensym "C")))
+                  (push (list variable form) *bindings*)
+                  variable)))
 
-  (defun split (a)
-    "The constant term and the top coefficient of A, two elements of the level below."
-    (let ((h (floor (length a) 2)))
-      (values (subseq a 0 h) (subseq a h))))
+(defun split (a)
+  "The constant term and the top coefficient of A, two elements of the level below."
+  (let ((h (floor (length a) 2)))
+    (values (subseq a 0 h) (subseq a h))))
 
-  (defun add* (a b) (mapcar (lambda (x y) `(fadd ,x ,y)) a b))
-  (defun sub* (a b) (mapcar (lambda (x y) `(fsub ,x ,y)) a b))
-  (defun neg* (a) (mapcar (lambda (x) `(fneg ,x)) a))
+(defun add* (a b) (mapcar (lambda (x y) `(fadd ,x ,y)) a b))
+(defun sub* (a b) (mapcar (lambda (x y) `(fsub ,x ,y)) a b))
+(defun neg* (a) (mapcar (lambda (x) `(fneg ,x)) a))
 
-  (defun mul-by-generator* (a)
-    "A w, for w the generator of A's level: (A0 + A1 w) w = A1 w^2 + A0 w."
-    (if (rest a)
-        (multiple-value-bind (a0 a1) (split a)
-          (append (mul-by-generator* a1) a0))
-        (list `(fmul +nonres+ ,(first a)))))
+(defun mul-by-generator* (a)
+  "A w, for w the generator of A's level: (A0 + A1 w) w = A1 w^2 + A0 w."
+  (if (rest a)
+      (multiple-value-bind (a0 a1) (split a)
+        (append (mul-by-generator* a1) a0))
+      (list `(fmul +nonres+ ,(first a)))))
 
-  (defun mul* (a b)
-    "A B, by Karatsuba:
+(defun mul* (a b)
+  "A B on symbolic coordinates, by Karatsuba:
   (A0 + A1 w)(B0 + B1 w) = (A0 B0 + A1 B1 w^2) + ((A0 + A1)(B0 + B1) - A0 B0 - A1 B1) w."
-    (if (rest a)
-        (multiple-value-bind (a0 a1) (split a)
-          (multiple-value-bind (b0 b1) (split b)
-            (let ((lo (bind (mul* a0 b0)))
-                  (hi (bind (mul* a1 b1)))
-                  (mid (bind (mul* (bind (add* a0 a1)) (bind (add* b0 b1))))))
-              (append (add* lo (mul-by-generator* hi))
-                      (sub* (sub* mid lo) hi)))))
-        (list `(fmul ,(first a) ,(first b)))))
+  (if (rest a)
+      (multiple-value-bind (a0 a1) (split a)
+        (multiple-value-bind (b0 b1) (split b)
+          (let ((lo (bind (mul* a0 b0)))
+                (hi (bind (mul* a1 b1)))
+                (mid (bind (mul* (bind (add* a0 a1)) (bind (add* b0 b1))))))
+            (append (add* lo (mul-by-generator* hi))
+                    (sub* (sub* mid lo) hi)))))
+      (list `(fmul ,(first a) ,(first b)))))
 
-  (defun inv* (a)
-    "1/A for nonzero A: (A0 + A1 w)^-1 = (A0 - A1 w) / (A0^2 - A1^2 w^2), the norm one level down."
-    (if (rest a)
-        (multiple-value-bind (a0 a1) (split a)
-          (let ((norm-inverse (bind (inv* (bind (sub* (mul* a0 a0) (mul-by-generator* (mul* a1 a1))))))))
-            (append (mul* a0 norm-inverse) (neg* (mul* a1 norm-inverse)))))
-        (list `(finv ,(first a))))))
+(defun inv* (a)
+  "1/A on symbolic coordinates, for nonzero A:
+  (A0 + A1 w)^-1 = (A0 - A1 w) / (A0^2 - A1^2 w^2), with the norm one level down."
+  (if (rest a)
+      (multiple-value-bind (a0 a1) (split a)
+        (let ((norm-inverse (bind (inv* (bind (sub* (mul* a0 a0) (mul-by-generator* (mul* a1 a1))))))))
+          (append (mul* a0 norm-inverse) (neg* (mul* a1 norm-inverse)))))
+      (list `(finv ,(first a)))))
 
-(defmacro define-tower-function (name degree lambda-list symbolic-function)
-  "Define NAME, a function of the EXTs of degree DEGREE in LAMBDA-LIST, whose coordinates are
-those computed by SYMBOLIC-FUNCTION (MUL* or INV*) on the arguments' coordinates."
+(defun tower-code (operation degree)
+  "The LAMBDA form computing OPERATION (MUL* or INV*, of two or one EXTs) in degree DEGREE:
+OPERATION run on the arguments' coordinates, as straight-line code."
   (let* ((*bindings* '())
-         (result (apply symbolic-function
+         (arguments (subseq '(a b) 0 (if (eq operation 'inv*) 1 2)))
+         (result (apply operation
                         (mapcar (lambda (argument)
                                   (bind (loop for i below degree collect `(aref ,argument ,i))))
-                                lambda-list)))
+                                arguments)))
          (bindings (reverse *bindings*)))
-    `(defun ,name ,lambda-list
-       (declare (type ext ,@lambda-list) (optimize speed))
+    `(lambda ,arguments
+       (declare (type ext ,@arguments) (optimize speed)
+                (sb-ext:muffle-conditions sb-ext:compiler-note))
        (let* ,bindings
          (declare (type fp ,@(mapcar #'first bindings)))
          (let ((result (make-ext ,degree)))
@@ -205,24 +219,37 @@ those computed by SYMBOLIC-FUNCTION (MUL* or INV*) on the arguments' coordinates
                          append `((aref result ,i) ,form)))
            result)))))
 
-(define-tower-function mul-4 4 (a b) mul*)
-(define-tower-function mul-8 8 (a b) mul*)
-(define-tower-function inv-4 4 (a) inv*)
-(define-tower-function inv-8 8 (a) inv*)
+(defvar *tower-functions* '()
+  "An alist: operation -> a hash table, degree -> the compiled TOWER-CODE.")
+
+(defun tower-function (operation degree)
+  "TOWER-CODE of OPERATION in DEGREE, compiled on first use."
+  (let ((table (or (cdr (assoc operation *tower-functions*))
+                   (cdar (push (cons operation (make-hash-table)) *tower-functions*)))))
+    (or (gethash degree table)
+        (setf (gethash degree table)
+              (compile nil (tower-code operation degree))))))
+
+(defun by-degree (operation)
+  "A function of a degree giving OPERATION's compiled tower code, through a vector indexed by the
+degree in front of TOWER-FUNCTION (EXT* calls it for every product)."
+  (let ((cache (make-array 17 :initial-element nil)))
+    (lambda (degree)
+      (or (svref cache degree)
+          (setf (svref cache degree) (tower-function operation degree))))))
+
+(defparameter *multiplier* (by-degree 'mul*))
+(defparameter *inverter* (by-degree 'inv*))
 
 (defun ext* (a b)
-  "A B in F_p4 or F_p8."
-  (ecase (length a)
-    (4 (mul-4 a b))
-    (8 (mul-8 a b))))
+  "A B."
+  (funcall (the function (funcall *multiplier* (length a))) a b))
 
 (defun ext-inv (a)
   "1/A.  The inverse of zero signals FIELD-DIVISION-BY-ZERO, with the restarts USE-VALUE and
 RETURN-ZERO."
   (if (some #'plusp a)
-      (ecase (length a)
-        (4 (inv-4 a))
-        (8 (inv-8 a)))
+      (funcall (funcall *inverter* (length a)) a)
       (restart-case (error 'field-division-by-zero :operation 'ext-inv :operands (list a))
         (use-value (inverse)
           :report "Supply the inverse to use."

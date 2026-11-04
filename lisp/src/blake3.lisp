@@ -15,7 +15,7 @@
   (:use #:cl #:sable.util)
   (:export #:compress
            #:b3s #:make-b3s #:b3s-update #:b3s-copy #:b3s-digest
-           #:make-blake3 #:blake3-update #:blake3-digest #:blake3-hash))
+           #:make-blake3 #:blake3-update #:blake3-digest #:blake3-hash #:blake3-file))
 
 (in-package #:sable.blake3)
 
@@ -28,14 +28,16 @@
 (defconstant +root+ 8)
 (defconstant +chunk-length+ 1024)
 
-(define-constant +iv+
-    (make-array 8 :element-type 'word
-                  :initial-contents '(#x6A09E667 #xBB67AE85 #x3C6EF372 #xA54FF53A
-                                      #x510E527F #x9B05688C #x1F83D9AB #x5BE0CD19)))
+(defparameter *iv*
+  (make-array 8 :element-type 'word
+                :initial-contents '(#x6A09E667 #xBB67AE85 #x3C6EF372 #xA54FF53A
+                                    #x510E527F #x9B05688C #x1F83D9AB #x5BE0CD19))
+  "The BLAKE3 initialisation vector (that of SHA-256).")
 
-(define-constant +message-permutation+
-    (make-array 16 :element-type '(unsigned-byte 4)
-                   :initial-contents '(2 6 3 10 7 0 4 13 1 11 12 5 9 14 15 8)))
+(defparameter *message-permutation*
+  (make-array 16 :element-type '(unsigned-byte 4)
+                 :initial-contents '(2 6 3 10 7 0 4 13 1 11 12 5 9 14 15 8))
+  "The permutation of the message words between rounds.")
 
 ;;; ------------------------------------------------------------------ the compression function
 
@@ -48,7 +50,7 @@
         (m (copy-seq m)))
     (declare (type words v m))
     (replace v cv)
-    (replace v +iv+ :start1 8 :end2 4)
+    (replace v *iv* :start1 8 :end2 4)
     (setf (aref v 12) (ldb (byte 32 0) counter)
           (aref v 13) (ldb (byte 32 32) counter)
           (aref v 14) block-length
@@ -78,7 +80,7 @@
           (g 1 6 11 12 (aref m 10) (aref m 11))
           (g 2 7 8 13 (aref m 12) (aref m 13))
           (g 3 4 9 14 (aref m 14) (aref m 15))
-          (setf m (map 'words (lambda (i) (aref m i)) +message-permutation+)))))
+          (setf m (map 'words (lambda (i) (aref m i)) *message-permutation*)))))
     (dotimes (i 8 v)
       (let ((lo (aref v i))
             (hi (aref v (+ i 8))))
@@ -124,7 +126,7 @@ flags FLAGS | ROOT, as little-endian bytes."
 
 (defstruct (b3s (:constructor %make-b3s) (:copier nil))
   "The state of struct B3S: chaining value, pending block, blocks compressed so far."
-  (cv (copy-seq +iv+) :type words)
+  (cv (copy-seq *iv*) :type words)
   (block (make-octets 64) :type (octets 64))
   (used 0 :type (integer 0 64))
   (counter 0 :type (unsigned-byte 64)))
@@ -155,7 +157,7 @@ flags FLAGS | ROOT, as little-endian bytes."
 ;;; ------------------------------------------------------------------ standard BLAKE3 (tree mode)
 
 (defstruct (chunk (:constructor make-chunk (counter)))
-  (cv (copy-seq +iv+) :type words)
+  (cv (copy-seq *iv*) :type words)
   (counter 0 :type (unsigned-byte 64))
   (block (make-octets 64) :type (octets 64))
   (used 0 :type (integer 0 64))
@@ -186,7 +188,7 @@ flags FLAGS | ROOT, as little-endian bytes."
              (logior (chunk-start-flag c) +chunk-end+)))
 
 (defun parent-node (left-cv right-cv)
-  (make-node +iv+ (concatenate 'words left-cv right-cv) 0 64 +parent+))
+  (make-node *iv* (concatenate 'words left-cv right-cv) 0 64 +parent+))
 
 (defun node-chaining-value (node)
   (chaining-value (compress (node-cv node) (node-words node) (node-counter node)
@@ -229,3 +231,13 @@ trailing zero bit of the chunk count), and start the next chunk."
 (defun blake3-hash (data &optional (n 32))
   "The N-byte BLAKE3 hash of the octets DATA."
   (blake3-digest (blake3-update (make-blake3) data) n))
+
+(defun blake3-file (path &optional (n 32))
+  "The N-byte BLAKE3 hash of the file PATH (b3sum's digest)."
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (loop with hasher = (make-blake3)
+          with buffer = (make-octets (expt 2 20))
+          for count = (read-sequence buffer in)
+          while (plusp count)
+          do (blake3-update hasher buffer :end count)
+          finally (return (blake3-digest hasher n)))))

@@ -21,7 +21,7 @@
 
 (in-package #:sable.transcript)
 
-(define-constant +domain+ "LLM-SUMCHECK-v6-O|"
+(defparameter *domain* "LLM-SUMCHECK-v6-O|"
   "The prefix of every transcript label.")
 
 ;;; ------------------------------------------------------------------ messages
@@ -77,7 +77,7 @@
 sequence of proof messages), a verifier transcript that replays them."
   (make-instance 'transcript
                  :degree (check-degree degree)
-                 :state (make-b3s (concatenate 'octets (to-octets +domain+) (to-octets label)))
+                 :state (make-b3s (concatenate 'octets (to-octets *domain*) (to-octets label)))
                  :verifier-p verifier-p
                  :messages (if verifier-p
                                (coerce messages 'vector)

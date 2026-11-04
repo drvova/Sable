@@ -1,24 +1,25 @@
 ;;;; sable.asd -- the Common Lisp (SBCL) port of Sable's host-side verifier core.
 
 (defsystem "sable"
-  :description "Sable: KoalaBear field tower, BLAKE3 Fiat-Shamir transcript, proof byte format,
-Reed-Solomon code and sumcheck verifier, ported from the Python implementation (zk/)."
+  :description "Sable: KoalaBear field tower, field arithmetic as Lisp forms, BLAKE3 Fiat-Shamir
+transcript, proof byte format, Reed-Solomon code and sumcheck, ported from the Python
+implementation (zk/)."
   :version "1.0.0"
   :author "Tomer Solberg <research@moonmath.ai>"
   :license "MIT"
-  :depends-on ()
+  :depends-on ((:require "sb-introspect"))
   :serial t
   :pathname "src/"
   :components ((:file "util")
                (:file "conditions")
                (:file "field")
+               (:file "forms")
                (:file "blake3")
                (:file "transcript")
                (:file "proofio")
-               (:file "poly")
                (:file "rs")
                (:file "sumcheck")
-               (:file "cli"))
+               (:file "toplevel"))
   :in-order-to ((test-op (test-op "sable/tests"))))
 
 (defsystem "sable/tests"

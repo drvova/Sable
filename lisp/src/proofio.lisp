@@ -10,12 +10,12 @@
 
 (defpackage #:sable.proofio
   (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.transcript)
-  (:export #:+magic+ #:+max-rank+ #:encode-proof #:decode-proof #:read-proof-file #:write-proof-file
+  (:export #:*magic* #:+max-rank+ #:encode-proof #:decode-proof #:read-proof-file #:write-proof-file
            #:describe-proof))
 
 (in-package #:sable.proofio)
 
-(define-constant +magic+ (to-octets "SABLEPF1"))
+(defparameter *magic* (to-octets "SABLEPF1") "The first bytes of every proof.")
 (defconstant +max-rank+ 8)
 
 ;;; ------------------------------------------------------------------ encoding
@@ -40,7 +40,7 @@
 
 (defun encode-proof (messages)
   "MESSAGES (byte messages and field arrays) -> OCTETS."
-  (join-octets (list* +magic+
+  (join-octets (list* *magic*
                       (le-bytes (length messages) 4)
                       (loop for message in (coerce messages 'list)
                             append (encode-message message)))))
@@ -87,10 +87,10 @@
                    (0 (read-bytes))
                    (1 (read-field-array offset))
                    (t (malformed :unknown-tag :offset offset :detail (format nil "tag ~D" tag)))))))
-      (unless (and (<= (length +magic+) (- end position))
-                   (equalp +magic+ (subseq octets position (+ position (length +magic+)))))
+      (unless (and (<= (length *magic*) (- end position))
+                   (equalp *magic* (subseq octets position (+ position (length *magic*)))))
         (malformed :magic :offset position))
-      (take (length +magic+))
+      (take (length *magic*))
       (let ((messages (loop repeat (read-uint 4) collect (read-message))))
         (unless (= position end)
           (malformed :trailing-bytes :offset position :detail (format nil "~D bytes" (- end position))))

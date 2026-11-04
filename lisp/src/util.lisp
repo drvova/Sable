@@ -1,24 +1,13 @@
-;;;; util.lisp -- octet vectors, little-endian integers, and DEFINE-CONSTANT.
+;;;; util.lisp -- octet vectors and little-endian integers.
 
 (defpackage #:sable.util
   (:use #:cl)
-  (:export #:octets #:make-octets #:to-octets #:join-octets #:le-bytes #:le-integer
-           #:define-constant))
+  (:export #:octets #:make-octets #:to-octets #:join-octets #:le-bytes #:le-integer))
 
 (in-package #:sable.util)
 
 (deftype octets (&optional (length '*))
   `(simple-array (unsigned-byte 8) (,length)))
-
-(defmacro define-constant (name value &optional documentation)
-  "DEFCONSTANT for a value that is EQUALP but not EQL across evaluations (a vector, a string):
-reloading the file keeps the existing value instead of signalling a redefinition."
-  `(defconstant ,name
-     (let ((new ,value))
-       (if (and (boundp ',name) (equalp (symbol-value ',name) new))
-           (symbol-value ',name)
-           new))
-     ,@(when documentation (list documentation))))
 
 (defun make-octets (length)
   (make-array length :element-type '(unsigned-byte 8) :initial-element 0))
