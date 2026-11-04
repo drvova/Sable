@@ -23,18 +23,25 @@
 (defun vectors (kind)
   (loop for v in *vectors* when (eq (first v) kind) collect (rest v)))
 
-(defmacro do-vectors ((kind &rest keys) &body body)
-  "Run BODY for each vector of KIND, binding each of KEYS to the value of the same-named keyword."
-  (let ((v (gensym)))
-    `(let ((n 0))
-       (dolist (,v (vectors ,kind))
-         (incf n)
-         (let ,(mapcar (lambda (k) `(,k (getf ,v ,(intern (symbol-name k) :keyword)))) keys)
-           ,@body))
-       (check (plusp n) "no vectors of kind ~S" ,kind))))
+(declaim (ftype (function (t) nil) missing-key))
+(defun missing-key (key)
+  (error "a test vector has no ~S" key))
 
-(defun e (list) (ext-coerce list))
-(defun exts (lists) (map 'simple-vector #'e lists))
+(defmacro do-vectors ((kind &rest keys) &body body)
+  "Run BODY for each vector of KIND, with each of KEYS bound to the value of the same-named
+keyword; check that there is at least one."
+  (let ((vector (gensym "VECTOR")))
+    `(progn
+       (check (vectors ,kind) "no vectors of kind ~S" ,kind)
+       (dolist (,vector (vectors ,kind))
+         (destructuring-bind (&key ,@(mapcar (lambda (k) `(,k (missing-key ',k))) keys)
+                              &allow-other-keys)
+             ,vector
+           (declare (ignorable ,@keys))
+           ,@body)))))
+
+(defun e (list) (coerce-ext list))
+(defun exts (lists) (map 'vector #'e lists))
 (defun same (ext list) (equal (coerce ext 'list) list))
 
 ;;; ------------------------------------------------------------------ field
@@ -71,7 +78,7 @@
   ;; the restarts: RETURN-ZERO (the Python convention) and USE-VALUE
   (check (= 0 (handler-bind ((field-division-by-zero #'return-zero)) (finv 0))))
   (check (= 7 (handler-bind ((field-division-by-zero (lambda (c) (use-value 7 c)))) (finv +p+))))
-  (check (every #'zerop (handler-bind ((field-division-by-zero #'return-zero)) (ext-inv (ext-zero 8)))))
+  (check (every #'zerop (handler-bind ((field-division-by-zero #'return-zero)) (ext-inv (make-ext 8)))))
   (check (= 5 (finv (finv 5)))))
 
 (deftest invalid-parameter-restart
@@ -96,7 +103,7 @@
 
 (deftest blake3-sequential
   (do-vectors (:b3s chunks digest xof)
-    (let ((s (b3s-init)))
+    (let ((s (make-b3s)))
       (dolist (c chunks) (b3s-update s (hex c)))
       (check (equalp (b3s-digest s 32) (hex digest)))
       (check (equalp (b3s-digest (b3s-copy s) 200) (hex xof))))))
@@ -107,7 +114,8 @@
       (dolist (op ops)
         (destructuring-bind (kind &rest args) op
           (cond ((string= kind "absorb") (absorb tr (hex (first args))))
-                ((string= kind "absorb-ext") (absorb-field tr (coerce (first args) 'vector)))
+                ((string= kind "absorb-ext")
+                 (absorb tr (message-octets (to-field-array (first args)))))
                 ((string= kind "challenge-base")
                  (check (equal (challenge-base tr (first args)) (second args))))
                 ((string= kind "challenge")
@@ -132,7 +140,7 @@
     (let* ((bad (copy-seq (aref (transcript-messages p) 0))))
       (setf (aref bad 0) (logxor (aref bad 0) 1))
       (unless (check-grind (b3s-digest (transcript-state (make-transcript "pow" 4)) 32)
-                           (loop for i below 8 sum (ash (aref bad i) (* 8 i))) 6)
+                           (le-integer bad) 6)
         (check-signals verification-failure
                        (verify-grind (make-transcript "pow" 4 :messages (list bad)) 6))))))
 
@@ -141,7 +149,7 @@
 (deftest proofio-roundtrip
   (do-vectors (:proofio bytes msgs)
     (let* ((b (hex bytes))
-           (parsed (sable.proofio:read-proof b)))
+           (parsed (sable.proofio:decode-proof b)))
       (check (= (length parsed) (length msgs)))
       (loop for m across parsed
             for (kind . spec) in msgs
@@ -150,7 +158,7 @@
                    (progn (check (equal (array-dimensions m) (first spec)))
                           (check (equal (loop for i below (array-total-size m) collect (row-major-aref m i))
                                         (second spec))))))
-      (check (equalp (sable.proofio:write-proof parsed) b)))))
+      (check (equalp (sable.proofio:encode-proof parsed) b)))))
 
 (deftest proofio-rejects-malformed
   (let ((reasons '(("magic" . :magic) ("truncated" . :truncated) ("trailing" . :trailing-bytes)
@@ -159,7 +167,7 @@
                    ;; the shape wraps to 0); the exact product here exceeds the input
                    ("huge" . :truncated))))
     (do-vectors (:proofio-bad why bytes)
-      (let ((c (check-signals malformed-proof (sable.proofio:read-proof (hex bytes)))))
+      (let ((c (check-signals malformed-proof (sable.proofio:decode-proof (hex bytes)))))
         (check (eq (malformed-proof-reason c) (cdr (assoc why reasons :test #'string=)))
                "~A: got ~S (~A)" why (malformed-proof-reason c) c)))))
 
@@ -199,7 +207,7 @@
 
 (deftest sumcheck-against-python
   (do-vectors (:sumcheck d n tables eq-r claim proof rho reduced finals)
-    (let* ((msgs (sable.proofio:read-proof (hex proof)))
+    (let* ((msgs (sable.proofio:decode-proof (hex proof)))
            (eq-r (and eq-r (exts eq-r)))
            (tr (make-transcript "sc-vec" d :messages msgs)))
       ;; the verifier on the Python prover's proof
@@ -215,7 +223,7 @@
         (multiple-value-bind (prho pfinals) (sable.sumcheck:prove-product ptr n tabs :eq-r eq-r)
           (check (equal (map 'list (lambda (v) (coerce v 'list)) prho) rho))
           (check (equal (mapcar (lambda (v) (coerce v 'list)) pfinals) finals))
-          (check (equalp (sable.proofio:write-proof (transcript-messages ptr)) (hex proof))))))))
+          (check (equalp (sable.proofio:encode-proof (transcript-messages ptr)) (hex proof))))))))
 
 (deftest sumcheck-rejects-forgeries
   (let* ((v (first (vectors :sumcheck)))
@@ -227,13 +235,13 @@
                (multiple-value-bind (rho red) (sable.sumcheck:verify tr n ntab claim)
                  (declare (ignore rho))
                  (sable.sumcheck:check-reduced red (reduce #'ext* finals))))))
-      (let ((good (sable.proofio:read-proof (hex (getf v :proof)))))
+      (let ((good (sable.proofio:decode-proof (hex (getf v :proof)))))
         (check (run good))
         ;; a wrong claim
         (check-signals verification-failure (run good (ext+ claim (ext-one d))))
         ;; each round message changed in one coordinate
         (dotimes (j n)
-          (let ((msgs (sable.proofio:read-proof (hex (getf v :proof)))))
+          (let ((msgs (sable.proofio:decode-proof (hex (getf v :proof)))))
             (setf (aref (aref msgs j) 0 1) (fadd (aref (aref msgs j) 0 1) 1))
             (check-signals verification-failure (run msgs))))
         ;; a message of the wrong shape, and a missing one

@@ -2,135 +2,138 @@
 ;;;;
 ;;;;   proof   = MAGIC | u32 count | message*
 ;;;;   message = u8 0 | u64 length | bytes                                  (a byte message)
-;;;;           | u8 1 | u8 ndim | u64 dim * ndim | u32 value * prod(dims)  (a field array, values < p)
+;;;;           | u8 1 | u8 rank | u64 dim * rank | u32 value * prod(dims)  (a field array, values < p)
 ;;;;
-;;;; All integers little-endian.  A byte message is an (ARRAY (UNSIGNED-BYTE 8)); a field array is an
-;;;; (ARRAY (UNSIGNED-BYTE 32)) of rank 0 to 8.  READ-PROOF checks every length against the remaining
-;;;; input and every value against p, and signals MALFORMED-PROOF on any malformed proof.  The
-;;;; product of the dimensions is computed exactly, so a shape whose product overflows 64 bits is
-;;;; rejected as truncated.
+;;;; All integers little-endian.  DECODE-PROOF checks every length against the remaining input and
+;;;; every value against p, and signals MALFORMED-PROOF on any malformed proof.  It multiplies the
+;;;; dimensions exactly, so a shape whose size overflows 64 bits is rejected as truncated.
 
 (defpackage #:sable.proofio
-  (:use #:cl #:sable.conditions #:sable.field #:sable.blake3)
-  (:import-from #:sable.transcript #:field-array-p #:byte-message-p #:field-array-octets)
-  (:export #:+magic+ #:+max-ndim+ #:write-proof #:read-proof #:read-proof-file #:write-proof-file
+  (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.transcript)
+  (:export #:+magic+ #:+max-rank+ #:encode-proof #:decode-proof #:read-proof-file #:write-proof-file
            #:describe-proof))
 
 (in-package #:sable.proofio)
 
-(defparameter +magic+ (sb-ext:string-to-octets "SABLEPF1" :external-format :latin-1))
-(defconstant +max-ndim+ 8)
+(define-constant +magic+ (to-octets "SABLEPF1"))
+(defconstant +max-rank+ 8)
 
-(defun write-proof (messages)
+;;; ------------------------------------------------------------------ encoding
+
+(defun canonical-p (array)
+  (loop for i below (array-total-size array)
+        always (< (row-major-aref array i) +p+)))
+
+(defun encode-message (message)
+  "The bytes of MESSAGE, as a list of byte vectors."
+  (etypecase message
+    (byte-message
+     (list #(0) (le-bytes (length message)) message))
+    (field-array
+     (let ((dimensions (array-dimensions message)))
+       (check-parameter message (lambda (m) (<= (array-rank m) +max-rank+))
+                        (format nil "an array of rank at most ~D" +max-rank+))
+       (check-parameter message #'canonical-p "values below p")
+       `(#(1) ,(vector (length dimensions))
+         ,@(mapcar #'le-bytes dimensions)
+         ,(message-octets message))))))
+
+(defun encode-proof (messages)
   "MESSAGES (byte messages and field arrays) -> OCTETS."
-  (let ((parts (list (u64-le (length messages) 4) +magic+)))     ; reversed, like the pushes below
-    (map nil (lambda (m)
-               (cond ((byte-message-p m)
-                      (push (octets-concat '(0) (u64-le (length m))) parts)
-                      (push (coerce m 'octets) parts))
-                     ((field-array-p m)
-                      (let ((dims (array-dimensions m)))
-                        (when (> (length dims) +max-ndim+)
-                          (error 'invalid-parameter :name 'array-rank :value (length dims)
-                                                    :expected (format nil "<= ~D" +max-ndim+)))
-                        (dotimes (i (array-total-size m))
-                          (unless (< (row-major-aref m i) +p+)
-                            (error 'invalid-parameter :name 'field-value :value (row-major-aref m i)
-                                                      :expected "below p")))
-                        (push (apply #'octets-concat (list 1 (length dims)) (mapcar #'u64-le dims)) parts)
-                        (push (field-array-octets m) parts)))
-                     (t (error 'invalid-parameter :name 'proof-message :value (type-of m)
-                                                  :expected "a byte message or a field array"))))
-         messages)
-    (apply #'octets-concat (nreverse parts))))
+  (join-octets (list* +magic+
+                      (le-bytes (length messages) 4)
+                      (loop for message in (coerce messages 'list)
+                            append (encode-message message)))))
 
-(defun read-proof (bytes &key (start 0) (end (length bytes)))
-  "Parse BYTES[START, END) as a proof -> a simple-vector of messages.  Signals MALFORMED-PROOF."
-  (declare (type (simple-array (unsigned-byte 8) (*)) bytes) (type fixnum start end))
-  (let ((pos start))
-    (declare (type fixnum pos))
+;;; ------------------------------------------------------------------ decoding
+
+(defun decode-proof (octets &key (start 0) (end (length octets)))
+  "Parse OCTETS[START, END) as a proof -> a vector of messages.  Signals MALFORMED-PROOF."
+  (let ((octets (to-octets octets))
+        (position start))
     (labels ((take (n)
-               (when (or (minusp n) (> n (- end pos)))
-                 (malformed :truncated :offset pos :detail (format nil "~D bytes needed" n)))
-               (prog1 pos (incf pos n)))
-             (uint (nbytes)
-               (let ((at (take nbytes)) (v 0))
-                 (dotimes (i nbytes v)
-                   (setf v (logior v (ash (aref bytes (+ at i)) (* 8 i))))))))
-      (unless (and (>= (- end pos) (length +magic+))
-                   (not (mismatch +magic+ bytes :start2 pos :end2 (+ pos (length +magic+)))))
-        (malformed :magic :offset pos))
-      (incf pos (length +magic+))
-      (let* ((count (uint 4))
-             (msgs (make-array count :fill-pointer 0)))
-        (dotimes (k count)
-          (let* ((at pos)
-                 (tag (uint 1)))
-            (case tag
-              (0 (let* ((n (uint 8))
-                        (from (take n)))
-                   (vector-push (subseq bytes from (+ from n)) msgs)))
-              (1 (let ((ndim (uint 1)))
-                   (when (> ndim +max-ndim+)
-                     (malformed :rank :offset at :detail (format nil "rank ~D" ndim)))
-                   (let* ((dims (loop repeat ndim collect (uint 8)))
-                          (n (reduce #'* dims)))
-                     (when (some (lambda (d) (>= d array-dimension-limit)) dims)
-                       (malformed :dimension :offset at :detail (format nil "dimensions ~S" dims)))
-                     ;; exact product: a shape that overflows 64 bits cannot fit in the input
-                     (when (> n (floor (- end pos) 4))
-                       (malformed :truncated :offset at
-                                  :detail (format nil "array of ~D values" n)))
-                     (let* ((from (take (* 4 n)))
-                            (a (make-array dims :element-type '(unsigned-byte 32))))
-                       (dotimes (i n)
-                         (let* ((o (+ from (* 4 i)))
-                                (v (logior (aref bytes o) (ash (aref bytes (+ o 1)) 8)
-                                           (ash (aref bytes (+ o 2)) 16) (ash (aref bytes (+ o 3)) 24))))
-                           (unless (< v +p+)
-                             (malformed :value-range :offset o :detail (format nil "value ~D" v)))
-                           (setf (row-major-aref a i) v)))
-                       (vector-push a msgs)))))
-              (t (malformed :unknown-tag :offset at :detail (format nil "tag ~D" tag))))))
-        (unless (= pos end)
-          (malformed :trailing-bytes :offset pos :detail (format nil "~D bytes" (- end pos))))
-        (coerce msgs 'simple-vector)))))
+               "Skip the next N bytes; return their offset."
+               (when (> n (- end position))
+                 (malformed :truncated :offset position :detail (format nil "~D bytes needed" n)))
+               (shiftf position (+ position n)))
+             (read-uint (size)
+               (le-integer octets (take size) size))
+             (read-bytes ()
+               (let* ((length (read-uint 8))
+                      (from (take length)))
+                 (subseq octets from (+ from length))))
+             (read-field-array (offset)
+               (let ((rank (read-uint 1)))
+                 (when (> rank +max-rank+)
+                   (malformed :rank :offset offset :detail (format nil "rank ~D" rank)))
+                 (let* ((dimensions (loop repeat rank collect (read-uint 8)))
+                        (size (reduce #'* dimensions)))
+                   (when (> (* 4 size) (- end position))
+                     (malformed :truncated :offset offset :detail (format nil "~D values" size)))
+                   (when (some (lambda (d) (>= d array-dimension-limit)) dimensions)
+                     (malformed :dimension :offset offset :detail (format nil "~S" dimensions)))
+                   (let ((from (take (* 4 size)))
+                         (array (make-array dimensions :element-type '(unsigned-byte 32))))
+                     (dotimes (i size array)
+                       (let ((value (le-integer octets (+ from (* 4 i)) 4)))
+                         (unless (< value +p+)
+                           (malformed :value-range :offset (+ from (* 4 i))
+                                                   :detail (format nil "value ~D" value)))
+                         (setf (row-major-aref array i) value)))))))
+             (read-message ()
+               (let* ((offset position)
+                      (tag (read-uint 1)))
+                 (case tag
+                   (0 (read-bytes))
+                   (1 (read-field-array offset))
+                   (t (malformed :unknown-tag :offset offset :detail (format nil "tag ~D" tag)))))))
+      (unless (and (<= (length +magic+) (- end position))
+                   (equalp +magic+ (subseq octets position (+ position (length +magic+)))))
+        (malformed :magic :offset position))
+      (take (length +magic+))
+      (let ((messages (loop repeat (read-uint 4) collect (read-message))))
+        (unless (= position end)
+          (malformed :trailing-bytes :offset position :detail (format nil "~D bytes" (- end position))))
+        (coerce messages 'vector)))))
+
+;;; ------------------------------------------------------------------ files
 
 (defun read-file-octets (path)
   (with-open-file (in path :element-type '(unsigned-byte 8))
-    (let ((buf (make-octets (file-length in))))
-      (let ((n (read-sequence buf in)))
-        (if (= n (length buf)) buf (subseq buf 0 n))))))
+    (let ((octets (make-octets (file-length in))))
+      (subseq octets 0 (read-sequence octets in)))))
 
 (defun read-proof-file (path)
-  "Read and parse the proof file PATH (zk/proofio.py format, e.g. the .proof of BENCH_SAVE)."
-  (read-proof (read-file-octets path)))
+  "The messages of the proof file PATH (e.g. the .proof written by BENCH_SAVE)."
+  (decode-proof (read-file-octets path)))
 
 (defun write-proof-file (path messages &key (if-exists :supersede))
   (with-open-file (out path :element-type '(unsigned-byte 8) :direction :output :if-exists if-exists)
-    (write-sequence (write-proof messages) out))
+    (write-sequence (encode-proof messages) out))
   path)
 
-(defun describe-proof (messages &optional (stream *standard-output*))
-  "A summary of a parsed proof: counts and sizes by message kind and shape."
-  (let ((shapes (make-hash-table :test 'equal))
-        (nbytes 0) (nfield 0) (byte-total 0) (field-total 0))
-    (map nil (lambda (m)
-               (if (byte-message-p m)
-                   (progn (incf nbytes) (incf byte-total (length m))
-                          (incf (gethash (list :bytes (length m)) shapes 0)))
-                   (progn (incf nfield) (incf field-total (array-total-size m))
-                          (incf (gethash (array-dimensions m) shapes 0)))))
-         messages)
-    (format stream "~&~D messages: ~D byte messages (~:D bytes), ~D field arrays (~:D values, ~:D bytes)~%"
-            (length messages) nbytes byte-total nfield field-total (* 4 field-total))
-    (let ((rows '()))
-      (maphash (lambda (k v) (push (cons k v) rows)) shapes)
-      (setf rows (sort rows #'> :key #'cdr))
+;;; ------------------------------------------------------------------ summary
+
+(defun describe-proof (messages &optional (stream *standard-output*) (limit 25))
+  "Print the number and total size of MESSAGES, and how many have each shape (the LIMIT most
+common shapes)."
+  (let ((shapes (make-hash-table :test 'equal)))
+    (map nil (lambda (m) (incf (gethash (message-shape m) shapes 0))) messages)
+    (flet ((total (type)
+             (loop for m across (coerce messages 'vector)
+                   when (typep m type) count t into n and sum (message-size m) into size
+                   finally (return (values n size)))))
+      (multiple-value-bind (nbytes byte-size) (total 'byte-message)
+        (multiple-value-bind (nfield field-size) (total 'field-array)
+          (format stream "~&~D messages: ~D byte messages (~:D bytes), ~D field arrays (~:D bytes)~%"
+                  (length messages) nbytes byte-size nfield field-size))))
+    (let ((rows (sort (loop for shape being the hash-keys of shapes using (hash-value count)
+                            collect (cons shape count))
+                      #'> :key #'cdr)))
       (format stream "~&~10@A  shape~%" "count")
       (loop for (shape . count) in rows
-            repeat 25
-            do (format stream "~10D  ~:[(~{~D~^ x ~})~;~{~(~A~) ~D~}~]~%" count (eq (car shape) :bytes) shape))
-      (when (> (length rows) 25)
-        (format stream "~10@A  ... ~D more shapes~%" "" (- (length rows) 25))))
-    (values (length messages) nbytes nfield)))
+            repeat limit
+            do (format stream "~10D  ~:[(~{~D~^ x ~})~;~{~(~A~) ~D~}~]~%"
+                       count (eq (first shape) :bytes) shape))
+      (when (> (length rows) limit)
+        (format stream "~10@A  ... ~D more shapes~%" "" (- (length rows) limit))))))

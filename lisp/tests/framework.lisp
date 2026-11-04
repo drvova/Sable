@@ -7,7 +7,7 @@
 ;;;; failed expectation and an unexpected error are reported differently.
 
 (defpackage #:sable.tests
-  (:use #:cl #:sable.conditions #:sable.field #:sable.blake3 #:sable.transcript)
+  (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.blake3 #:sable.transcript)
   (:export #:run-tests #:deftest #:check #:check-signals #:*tests*))
 
 (in-package #:sable.tests)

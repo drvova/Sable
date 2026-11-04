@@ -9,7 +9,8 @@ Reed-Solomon code and sumcheck verifier, ported from the Python implementation (
   :depends-on ()
   :serial t
   :pathname "src/"
-  :components ((:file "conditions")
+  :components ((:file "util")
+               (:file "conditions")
                (:file "field")
                (:file "blake3")
                (:file "transcript")

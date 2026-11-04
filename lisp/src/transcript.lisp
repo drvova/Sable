@@ -1,256 +1,230 @@
 ;;;; transcript.lisp -- the Fiat-Shamir transcript (zk/transcript.py, host side).
 ;;;;
-;;;; The hash is the sequential BLAKE3 mode of zk/cuda/b3s.h.  absorb(data) hashes the length of
-;;;; DATA as a u64 LE, then DATA; a field array is absorbed as its canonical values, u32 LE, in
-;;;; row-major order.  A squeeze of n bytes reads n output bytes, then absorbs "squeeze" and the
+;;;; The hash is the sequential BLAKE3 mode of zk/cuda/b3s.h.  Absorbing DATA hashes its length as
+;;;; a u64 LE, then DATA.  A squeeze of n bytes reads n output bytes, then absorbs "squeeze" and the
 ;;;; first min(32, n) of them.  Field challenges are 31-bit words below p (rejection sampling).
 ;;;;
-;;;; A prover transcript records every message it sends; a verifier transcript is made from a
-;;;; proof's messages (PROOFIO:READ-PROOF) and replays them in order, absorbing each exactly as the
-;;;; prover did.  A message of the wrong kind or shape, or a missing one, rejects the proof.
+;;;; Messages are byte vectors (BYTE-MESSAGE) or arrays of field values (FIELD-ARRAY), the latter
+;;;; absorbed as their values, u32 LE, in row-major order.  A prover transcript records the
+;;;; messages it sends; a verifier transcript is made from a proof's messages and replays them, so
+;;;; both absorb the same bytes.  A message of the wrong kind or shape, or a missing one, rejects
+;;;; the proof.
 
 (defpackage #:sable.transcript
-  (:use #:cl #:sable.conditions #:sable.field #:sable.blake3)
-  (:export #:transcript #:make-transcript #:transcript-d #:transcript-verifier-p
-           #:transcript-messages #:transcript-position #:transcript-sent-bytes #:transcript-state
-           #:absorb #:absorb-field #:squeeze #:send #:send-bytes #:record #:record-bytes
-           #:challenge-base #:challenge #:challenges #:challenge-bits
-           #:grind #:verify-grind #:check-grind #:transcript-finished-p #:label-name
-           #:field-array-p #:byte-message-p #:field-array-octets #:+domain+))
+  (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.blake3)
+  (:export #:byte-message #:field-array #:to-field-array #:message-octets #:message-size #:message-shape
+           #:transcript #:make-transcript #:transcript-degree #:verifier-p #:transcript-messages
+           #:transcript-position #:transcript-sent-bytes #:transcript-state #:transcript-finished-p
+           #:absorb #:send #:send-bytes #:record #:record-bytes
+           #:squeeze #:challenge-base #:challenge #:challenges #:challenge-bits
+           #:check-grind #:grind #:verify-grind #:label-name))
 
 (in-package #:sable.transcript)
 
-(defparameter +domain+ "LLM-SUMCHECK-v6-O|"
-  "The domain-separation prefix of every transcript label.")
+(define-constant +domain+ "LLM-SUMCHECK-v6-O|"
+  "The prefix of every transcript label.")
 
-(defun ascii (s)
-  (if (stringp s) (sb-ext:string-to-octets s :external-format :utf-8) (coerce s 'octets)))
+;;; ------------------------------------------------------------------ messages
+
+(deftype byte-message () '(array (unsigned-byte 8)))
+(deftype field-array () '(array (unsigned-byte 32)))
+
+(defun to-field-array (x)
+  "A FIELD-ARRAY of the canonical values of X: an integer (rank 0), a sequence or an array."
+  (etypecase x
+    (integer (make-array '() :element-type '(unsigned-byte 32) :initial-element (modp x)))
+    (list (to-field-array (coerce x 'vector)))
+    (array (let ((a (make-array (array-dimensions x) :element-type '(unsigned-byte 32))))
+             (dotimes (i (array-total-size x) a)
+               (setf (row-major-aref a i) (modp (row-major-aref x i))))))))
+
+(defun message-octets (message)
+  "The bytes of MESSAGE as absorbed: a byte message itself, a field array as u32 LE values."
+  (etypecase message
+    (byte-message (to-octets message))
+    (field-array (let ((out (make-octets (* 4 (array-total-size message)))))
+                   (dotimes (i (array-total-size message) out)
+                     (let ((value (row-major-aref message i)))
+                       (dotimes (b 4)
+                         (setf (aref out (+ (* 4 i) b)) (ldb (byte 8 (* 8 b)) value)))))))))
+
+(defun message-size (message)
+  "The number of bytes of MESSAGE in a proof's payload."
+  (etypecase message
+    (byte-message (length message))
+    (field-array (* 4 (array-total-size message)))))
+
+(defun message-shape (message)
+  "The dimensions of a field array; (:BYTES length) for a byte message."
+  (etypecase message
+    (byte-message (list :bytes (length message)))
+    (field-array (array-dimensions message))))
+
+;;; ------------------------------------------------------------------ the transcript
 
 (defclass transcript ()
-  ((d :initarg :d :reader transcript-d :documentation "The extension degree of challenges.")
-   (state :initarg :state :accessor transcript-state :documentation "The B3S hash state.")
+  ((degree :initarg :degree :reader transcript-degree
+           :documentation "Challenges are elements of F_p^DEGREE.")
+   (state :initarg :state :reader transcript-state :documentation "The B3S hash state.")
    (messages :initarg :messages :reader transcript-messages
-             :documentation "Prover: messages sent so far.  Verifier: the proof's messages.")
+             :documentation "Prover: the messages sent so far.  Verifier: the proof's messages.")
    (position :initform 0 :accessor transcript-position)
-   (verifier-p :initarg :verifier-p :reader transcript-verifier-p)
+   (verifier-p :initarg :verifier-p :reader verifier-p)
    (sent-bytes :initform 0 :accessor transcript-sent-bytes)))
 
-(defun make-transcript (label d &key (messages nil verifier-p))
-  "A transcript for LABEL (string or octets) whose challenges lie in F_p^D.  With MESSAGES (a
+(defun make-transcript (label degree &key (messages nil verifier-p))
+  "A transcript for LABEL (a string or octets) with challenges in F_p^DEGREE.  With MESSAGES (a
 sequence of proof messages), a verifier transcript that replays them."
   (make-instance 'transcript
-                 :d (check-degree d)
-                 :state (b3s-init (octets-concat (ascii +domain+) (ascii label)))
+                 :degree (check-degree degree)
+                 :state (make-b3s (concatenate 'octets (to-octets +domain+) (to-octets label)))
                  :verifier-p verifier-p
                  :messages (if verifier-p
-                               (coerce messages 'simple-vector)
+                               (coerce messages 'vector)
                                (make-array 16 :adjustable t :fill-pointer 0))))
 
 (defmethod print-object ((tr transcript) stream)
   (print-unreadable-object (tr stream :type t :identity t)
-    (format stream "~:[prover~;verifier~] D=~D ~D/~D messages" (transcript-verifier-p tr)
-            (transcript-d tr) (transcript-position tr) (length (transcript-messages tr)))))
-
-;;; ------------------------------------------------------------------ messages
-
-(defun byte-message-p (m)
-  (typep m '(array (unsigned-byte 8))))
-
-(defun field-array-p (m)
-  (typep m '(array (unsigned-byte 32))))
-
-(defun field-array-octets (a)
-  "The canonical values of the field array A as u32 LE, row-major."
-  (let* ((n (array-total-size a))
-         (out (make-octets (* 4 n))))
-    (dotimes (i n out)
-      (let ((v (row-major-aref a i)))
-        (setf (aref out (* 4 i)) (ldb (byte 8 0) v)
-              (aref out (+ 1 (* 4 i))) (ldb (byte 8 8) v)
-              (aref out (+ 2 (* 4 i))) (ldb (byte 8 16) v)
-              (aref out (+ 3 (* 4 i))) (ldb (byte 8 24) v))))))
-
-(defun canonical-field-array (x)
-  "A field array of canonical values from X: an array of integers, a sequence, or an integer."
-  (etypecase x
-    (integer (let ((a (make-array '() :element-type '(unsigned-byte 32))))
-               (setf (aref a) (fp-canon x))
-               a))
-    (array (let ((a (make-array (array-dimensions x) :element-type '(unsigned-byte 32))))
-             (dotimes (i (array-total-size x) a)
-               (setf (row-major-aref a i) (fp-canon (row-major-aref x i))))))
-    (list (canonical-field-array (coerce x 'vector)))))
-
-(defun next-message (tr)
-  (let ((pos (transcript-position tr))
-        (msgs (transcript-messages tr)))
-    (when (>= pos (length msgs))
-      (error 'transcript-exhausted :index pos))
-    (setf (transcript-position tr) (1+ pos))
-    (aref msgs pos)))
-
-(defun take-field (tr shape)
-  "Verifier: the next message, which must be a field array of dimensions SHAPE (or any shape if
-SHAPE is :ANY)."
-  (let* ((pos (transcript-position tr))
-         (m (next-message tr)))
-    (unless (and (field-array-p m)
-                 (or (eq shape :any) (equal (array-dimensions m) shape)))
-      (error 'message-shape-error :index pos :expected shape
-                                  :actual (if (field-array-p m) (array-dimensions m) :bytes)))
-    m))
-
-(defun take-bytes (tr &optional length)
-  (let* ((pos (transcript-position tr))
-         (m (next-message tr)))
-    (unless (and (byte-message-p m) (or (null length) (= (length m) length)))
-      (error 'message-shape-error :index pos
-                                  :expected (if length (list :bytes length) :bytes)
-                                  :actual (if (byte-message-p m) (list :bytes (length m))
-                                              (array-dimensions m))))
-    m))
+    (format stream "~:[prover~;verifier~] F_p^~D, ~D/~D messages" (verifier-p tr)
+            (transcript-degree tr) (transcript-position tr) (length (transcript-messages tr)))))
 
 (defun transcript-finished-p (tr)
-  "True when a verifier has consumed every message of the proof."
+  "True when a verifier has taken every message of the proof."
   (= (transcript-position tr) (length (transcript-messages tr))))
-
-;;; ------------------------------------------------------------------ absorbing
 
 (defun absorb (tr data)
   "Absorb DATA (octets or a string): its length as u64 LE, then the bytes."
-  (let ((data (ascii data))
-        (st (transcript-state tr)))
-    (b3s-update st (u64-le (length data)))
-    (b3s-update st data)
+  (let ((data (to-octets data)))
+    (b3s-update (transcript-state tr) (le-bytes (length data)))
+    (b3s-update (transcript-state tr) data)
     tr))
 
-(defun absorb-field (tr a)
-  "Absorb the field array A (canonical values as u32 LE)."
-  (absorb tr (field-array-octets (canonical-field-array a))))
+(defun take-message (tr type shape)
+  "Verifier: the next message, which must be of TYPE and, unless SHAPE is :ANY, of SHAPE."
+  (with-accessors ((position transcript-position) (messages transcript-messages)) tr
+    (when (>= position (length messages))
+      (error 'transcript-exhausted :index position))
+    (let ((message (aref messages position)))
+      (unless (and (typep message type)
+                   (or (eq shape :any) (equal (message-shape message) shape)))
+        (error 'message-shape-error :index position
+                                    :expected (if (eq shape :any) type shape)
+                                    :actual (message-shape message)))
+      (incf position)
+      message)))
 
-(defun send (tr &optional arr (shape :any))
-  "Prover: record and absorb the field array ARR.  Verifier: take the next message, which must be a
-field array of dimensions SHAPE, absorb it and return it."
-  (let ((a (if (transcript-verifier-p tr)
-               (take-field tr shape)
-               (let ((a (canonical-field-array arr)))
-                 (vector-push-extend a (transcript-messages tr))
-                 a))))
-    (incf (transcript-sent-bytes tr) (* 4 (array-total-size a)))
-    (absorb tr (field-array-octets a))
-    a))
+(defun exchange (tr value type shape absorb)
+  "Prover: record VALUE as a message of TYPE.  Verifier: take the next message, of TYPE and SHAPE.
+Either way, absorb the message if ABSORB, and return it."
+  (let ((message (if (verifier-p tr)
+                     (take-message tr type shape)
+                     (let ((message (ecase type
+                                      (field-array (to-field-array value))
+                                      (byte-message (to-octets value)))))
+                       (vector-push-extend message (transcript-messages tr))
+                       message))))
+    (incf (transcript-sent-bytes tr) (message-size message))
+    (when absorb (absorb tr (message-octets message)))
+    message))
 
-(defun send-bytes (tr &optional b length)
-  "SEND for a byte message (LENGTH, if given, is checked by a verifier)."
-  (let ((b (if (transcript-verifier-p tr)
-               (take-bytes tr length)
-               (let ((b (coerce b 'octets)))
-                 (vector-push-extend b (transcript-messages tr))
-                 b))))
-    (incf (transcript-sent-bytes tr) (length b))
-    (absorb tr b)
-    b))
+(defun bytes-shape (length)
+  (if length (list :bytes length) :any))
 
-(defun record (tr &optional arr (shape :any))
-  "A field-array message that is part of the proof but not absorbed (final query openings)."
-  (let ((a (if (transcript-verifier-p tr)
-               (take-field tr shape)
-               (let ((a (canonical-field-array arr)))
-                 (vector-push-extend a (transcript-messages tr))
-                 a))))
-    (incf (transcript-sent-bytes tr) (* 4 (array-total-size a)))
-    a))
+(defun send (tr &optional value (shape :any))
+  "Send and absorb a field array.  A verifier passes no VALUE, and the SHAPE it expects."
+  (exchange tr value 'field-array shape t))
 
-(defun record-bytes (tr &optional b length)
-  "A byte message recorded without absorbing (see RECORD)."
-  (let ((b (if (transcript-verifier-p tr)
-               (take-bytes tr length)
-               (let ((b (coerce b 'octets)))
-                 (vector-push-extend b (transcript-messages tr))
-                 b))))
-    (incf (transcript-sent-bytes tr) (length b))
-    b))
+(defun send-bytes (tr &optional value length)
+  "Send and absorb a byte message.  A verifier passes no VALUE, and the LENGTH it expects."
+  (exchange tr value 'byte-message (bytes-shape length) t))
+
+(defun record (tr &optional value (shape :any))
+  "A field array that is part of the proof but not absorbed (the final query openings, after the
+last challenge)."
+  (exchange tr value 'field-array shape nil))
+
+(defun record-bytes (tr &optional value length)
+  "A byte message that is part of the proof but not absorbed."
+  (exchange tr value 'byte-message (bytes-shape length) nil))
 
 ;;; ------------------------------------------------------------------ challenges
 
 (defun squeeze (tr n)
-  (let* ((st (transcript-state tr))
-         (out (b3s-digest st n)))
-    (b3s-update st (ascii "squeeze"))
-    (b3s-update st out :end (min 32 n))
+  "N bytes of output; then absorb \"squeeze\" and the first min(32, N) of them."
+  (let ((out (b3s-digest (transcript-state tr) n)))
+    (b3s-update (transcript-state tr) (to-octets "squeeze"))
+    (b3s-update (transcript-state tr) out :end (min 32 n))
     out))
+
+(defun squeeze-field-elements (tr n)
+  "The 31-bit words of N squeezed bytes that are below p."
+  (loop with buffer = (squeeze tr n)
+        for i from 0 below n by 4
+        for word = (ldb (byte 31 0) (le-integer buffer i 4))
+        when (< word +p+) collect word))
 
 (defun challenge-base (tr k)
   "K base-field challenges, as a list."
-  (let ((vals '()) (got 0))
-    (loop while (< got k)
-          do (let ((buf (squeeze tr (* 4 (+ (- k got) 4)))))
-               (loop for i from 0 below (length buf) by 4
-                     for w = (logand #x7FFFFFFF
-                                     (logior (aref buf i) (ash (aref buf (+ i 1)) 8)
-                                             (ash (aref buf (+ i 2)) 16) (ash (aref buf (+ i 3)) 24)))
-                     when (and (< w +p+) (< got k))
-                       do (push w vals) (incf got))))
-    (nreverse vals)))
+  (let ((accepted '()))
+    (loop while (< (length accepted) k)
+          do (setf accepted (nconc accepted
+                                   (squeeze-field-elements tr (* 4 (+ (- k (length accepted)) 4))))))
+    (subseq accepted 0 k)))
 
-(defun challenge (tr &optional (d (transcript-d tr)))
-  "One extension-field challenge, an EXT of degree D."
-  (ext-coerce (challenge-base tr d)))
+(defun challenge (tr &optional (degree (transcript-degree tr)))
+  "One challenge in F_p^DEGREE."
+  (coerce-ext (challenge-base tr degree)))
 
-(defun challenges (tr k &optional (d (transcript-d tr)))
-  "K extension-field challenges (a vector of EXTs), from D*K consecutive base challenges."
-  (let ((flat (coerce (challenge-base tr (* d k)) 'simple-vector)))
-    (coerce (loop for j below k collect (ext-coerce (subseq flat (* j d) (* (1+ j) d)))) 'simple-vector)))
+(defun challenges (tr k &optional (degree (transcript-degree tr)))
+  "K challenges in F_p^DEGREE, from DEGREE * K consecutive base challenges."
+  (loop for tail on (challenge-base tr (* degree k)) by (lambda (l) (nthcdr degree l))
+        collect (coerce-ext (subseq tail 0 degree))))
 
 (defun challenge-bits (tr nbits k)
-  "K integers of NBITS bits each (the low bits of u64 LE words)."
-  (let ((buf (squeeze tr (* 8 k))))
-    (loop for j below k
-          collect (let ((w 0))
-                    (dotimes (i 8) (setf w (logior w (ash (aref buf (+ (* 8 j) i)) (* 8 i)))))
-                    (ldb (byte nbits 0) w)))))
+  "K integers of NBITS bits: the low bits of squeezed u64 LE words."
+  (loop with buffer = (squeeze tr (* 8 k))
+        for i below k
+        collect (ldb (byte nbits 0) (le-integer buffer (* 8 i) 8))))
 
 ;;; ------------------------------------------------------------------ proof of work
 
 (defun check-grind (base-digest nonce bits)
-  "True when BLAKE3(BASE-DIGEST || NONCE as u64 LE), read as a u64 LE, is below 2^(64-BITS)."
-  (let ((d (blake3-hash (octets-concat base-digest (u64-le nonce)) 8))
-        (w 0))
-    (dotimes (i 8) (setf w (logior w (ash (aref d i) (* 8 i)))))
-    (< w (ash 1 (- 64 bits)))))
+  "True when BLAKE3(BASE-DIGEST || NONCE as u64 LE), read as a u64 LE, is below 2^(64 - BITS)."
+  (< (le-integer (blake3-hash (concatenate 'octets base-digest (le-bytes nonce)) 8))
+     (expt 2 (- 64 bits))))
 
 (defun grind (tr bits)
-  "Prover (on the CPU, so only for small BITS): send the smallest nonce passing CHECK-GRIND."
-  (let ((base (b3s-digest (transcript-state tr) 32)))
-    (let ((nonce (loop for n from 0 when (check-grind base n bits) return n)))
-      (send-bytes tr (u64-le nonce))
-      nonce)))
+  "Prover, on the CPU (so for small BITS): send the smallest nonce that passes CHECK-GRIND."
+  (let* ((base (b3s-digest (transcript-state tr) 32))
+         (nonce (loop for n from 0 when (check-grind base n bits) return n)))
+    (send-bytes tr (le-bytes nonce))
+    nonce))
 
 (defun verify-grind (tr bits)
-  "Verifier: take the 8-byte nonce, check it.  Returns the nonce; rejects the proof on failure."
+  "Verifier: take the 8-byte nonce and check it; returns the nonce."
   (let* ((base (b3s-digest (transcript-state tr) 32))
-         (b (send-bytes tr nil 8))
-         (nonce (loop for i below 8 sum (ash (aref b i) (* 8 i)))))
+         (nonce (le-integer (send-bytes tr nil 8))))
     (unless (check-grind base nonce bits)
       (reject :proof-of-work "nonce ~D does not meet ~D bits" nonce bits))
     nonce))
 
 ;;; ------------------------------------------------------------------ labels
 
-(defun layer-prefix-end (s start end)
-  "If S[START, END) begins with digits followed by a dot, the index after the dot; else START."
-  (let ((i start))
-    (loop while (and (< i end) (char<= #\0 (char s i) #\9)) do (incf i))
-    (if (and (> i start) (< i end) (char= (char s i) #\.)) (1+ i) start)))
+(defun split-string (string separator)
+  (loop for start = 0 then (1+ end)
+        for end = (position separator string :start start)
+        collect (subseq string start end)
+        while end))
+
+(defun strip-layer-prefix (segment)
+  "SEGMENT without a leading layer index: \"12.mo\" -> \"mo\"."
+  (let ((dot (position-if-not (lambda (c) (char<= #\0 c #\9)) segment)))
+    (if (and dot (plusp dot) (char= (char segment dot) #\.))
+        (subseq segment (1+ dot))
+        segment)))
 
 (defun label-name (name)
   "A domain or group name as absorbed in the transcript, without its layer prefixes:
-\"12.mo\" -> \"mo\", \"3.oproj|3.rqo\" -> \"oproj|rqo\" (the layer index is absorbed once per layer)."
-  (with-output-to-string (out)
-    (let ((start 0) (n (length name)))
-      (loop
-        (let ((bar (or (position #\| name :start start) n)))
-          (write-string name out :start (layer-prefix-end name start bar) :end bar)
-          (when (>= bar n) (return))
-          (write-char #\| out)
-          (setf start (1+ bar)))))))
+\"12.mo\" -> \"mo\", \"3.oproj|3.rqo\" -> \"oproj|rqo\".  The layer index is absorbed once per
+layer instead, so a layer's labels do not depend on the layer."
+  (format nil "~{~A~^|~}" (mapcar #'strip-layer-prefix (split-string name #\|))))

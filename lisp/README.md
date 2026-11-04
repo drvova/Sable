@@ -13,15 +13,16 @@ proof bytes as the Python prover, and the Lisp verifier accepts the Python proof
 
 | Lisp (`src/`) | Python | Contents |
 |---|---|---|
+| `util.lisp` | | octet vectors, little-endian integers, `define-constant` |
 | `conditions.lisp` | (`ValueError`, `assert`) | the condition hierarchy, see below |
-| `field.lisp` | `zk/field.py`, `zk/fe.py` | KoalaBear F_p, the F_p4 / F_p8 tower, inverses, Lagrange interpolation, eq tables, MLE evaluation |
+| `field.lisp` | `zk/field.py`, `zk/fe.py` | KoalaBear F_p, the F_p4 / F_p8 tower (multiplication and inversion written once, recursively, and expanded by a macro into straight-line code per degree), Lagrange interpolation, eq tables, MLE evaluation |
 | `blake3.lisp` | `zk/cuda/b3s.h`, `blake3` | the sequential BLAKE3 mode of the transcript, and standard (tree-mode) BLAKE3 |
 | `transcript.lisp` | `zk/transcript.py` | the Fiat-Shamir transcript: absorb, send / record, challenges, proof of work, label names |
 | `proofio.lisp` | `zk/proofio.py` | the proof byte format (`SABLEPF1`), strict parser and writer |
 | `poly.lisp` | `zk/poly.py` | polynomials over column symbols |
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code: twiddles, encoding, folding |
 | `sumcheck.lisp` | `zk/sumcheck.py` (`verify`, `eval_terms`), `zk/cuda/vcore.cpp` | the sumcheck verifier, and a reference CPU prover for products of multilinear tables |
-| `cli.lisp` | | the command line of the executable |
+| `cli.lisp` | | the command line of the executable (`define-command`, which also writes the help) |
 
 Not ported yet:
 
@@ -63,6 +64,7 @@ sable selftest                   the test suite, with its vectors built into the
 | 1 | proof rejected (`malformed-proof`, `verification-failure`) |
 | 2 | usage or I/O error |
 | 3 | internal error (`SABLE_DEBUG=1` enters the debugger instead, with the stack intact) |
+| 141 | standard output closed (e.g. piped into `head`) |
 
 From Lisp:
 
@@ -98,8 +100,9 @@ Restarts appear only where continuing is sound:
 - **`finv` and `ext-inv` of zero** offer `use-value` and `return-zero`. `return-zero` gives the
   Python and C++ behaviour, where 0^(p-2) = 0:
   `(handler-bind ((field-division-by-zero #'return-zero)) (finv 0))` returns 0.
-- **`invalid-parameter`**, signalled by `root-of-unity` and by extension-degree checks, offers
-  `use-value`. The replacement value is checked again.
+- **`invalid-parameter`** is signalled by `check-parameter`, which works like `check-type`.
+  It offers `use-value`, and the replacement value is checked again. `root-of-unity`,
+  extension-degree checks and the Reed-Solomon and MLE length checks use it.
 - **The test runner** (`tests/framework.lisp`) wraps each test in `skip-test` and `retry-test`.
   `(sable.tests:run-tests :debug t)` sends failures to the debugger with those restarts on offer.
 

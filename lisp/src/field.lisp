@@ -5,49 +5,46 @@
 ;;;;   F_p4 = F_p2[y]/(y^2 - x)       (= F_p[Y]/(Y^4 - 3))
 ;;;;   F_p8 = F_p4[z]/(z^2 - y)       (= F_p[X]/(X^8 - 3))
 ;;;;
-;;;; A base element is an integer in [0, p).  An extension element (an EXT) is a
-;;;; (SIMPLE-ARRAY (UNSIGNED-BYTE 32) (D)) for D = 4 or 8, in the tower order of zk/field.py:
-;;;; F_p8 = (A, B) with A, B in F_p4, F_p4 = (a, b) with a, b in F_p2, F_p2 = (a0, a1).  F_p4 embeds
-;;;; in F_p8 as (A, 0).  Every function returns a fresh EXT and never modifies its arguments.
-;;;;
-;;;; The product of two values below p is below 2^62, so it is a fixnum on 64-bit SBCL and the
-;;;; arithmetic below compiles to machine integer operations.
+;;;; A base element is an integer in [0, p).  An extension element is an EXT, a vector of D
+;;;; coordinates in the tower order of zk/field.py: its first half is the constant term and its
+;;;; second half the coefficient of the top generator (z for F_p8, y for F_p4, x for F_p2), so
+;;;; each level is a pair of elements of the level below.  Multiplication and inversion are
+;;;; written once, recursively over the levels, and expanded by a macro into straight-line code
+;;;; for each degree (DEFINE-TOWER-FUNCTION).  The functions return fresh EXTs and never modify
+;;;; their arguments.
 
 (defpackage #:sable.field
   (:use #:cl #:sable.conditions)
-  (:export #:+p+ #:+nonres+ #:fp #:fp-canon #:fadd #:fsub #:fneg #:fmul #:fpow #:finv #:to-signed
-           #:ext #:ext-degree #:make-ext #:ext-zero #:ext-one #:ext-from-base #:ext-copy #:ext-coerce
-           #:ext= #:ext+ #:ext- #:ext-neg #:ext* #:ext-scale #:ext-inv #:ext-expt #:ext-mul-y
-           #:ext-eq1 #:ext-eq #:ext-dot #:embed #:lagrange #:eq-table #:mle-eval #:check-tower
-           #:check-degree))
+  (:export #:+p+ #:+nonres+ #:fp #:modp #:fadd #:fsub #:fneg #:fmul #:fpow #:finv #:to-signed
+           #:ext #:degree #:check-degree #:make-ext #:coerce-ext #:ext-one #:base->ext #:embed
+           #:ext= #:ext+ #:ext- #:ext-neg #:ext* #:ext-scale #:ext-inv #:ext-expt
+           #:ext-eq1 #:ext-eq #:ext-dot #:lagrange #:eq-table #:fold-table #:mle-eval #:check-tower))
 
 (in-package #:sable.field)
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +p+ (+ (- (expt 2 31) (expt 2 24)) 1) "The KoalaBear prime 2^31 - 2^24 + 1.")
-  (defconstant +nonres+ 3 "The non-residue of the tower: F_p2 = F_p[x]/(x^2 - 3)."))
+(defconstant +p+ (1+ (- (expt 2 31) (expt 2 24))) "The KoalaBear prime 2^31 - 2^24 + 1.")
+(defconstant +nonres+ 3 "The non-residue of the tower: F_p2 = F_p[x]/(x^2 - 3).")
 
-(deftype fp () `(integer 0 (,+p+)))
+(deftype fp () `(mod ,+p+))
 (deftype ext () '(simple-array (unsigned-byte 32) (*)))
-
-(declaim (optimize (speed 3) (safety 1) (debug 1)))
+(deftype degree () '(member 4 8))
 
 ;;; ------------------------------------------------------------------ F_p
 
-(declaim (inline fp-canon fadd fsub fneg fmul))
+;; Two values below p multiply to less than 2^62, a fixnum on 64-bit SBCL, so with these
+;; declarations the arithmetic compiles to machine operations.
+(declaim (inline modp fadd fsub fneg fmul))
 
-(defun fp-canon (x)
-  "Any integer -> its residue in [0, p)."
-  (declare (type integer x))
+(defun modp (x)
+  "The residue of the integer X in [0, p)."
   (mod x +p+))
 
 (defun fadd (a b)
-  (declare (type fp a b))
-  (let ((s (+ a b)))
-    (if (>= s +p+) (- s +p+) s)))
+  (declare (type fp a b) (optimize speed))
+  (let ((s (+ a b))) (if (< s +p+) s (- s +p+))))
 
 (defun fsub (a b)
-  (declare (type fp a b))
+  (declare (type fp a b) (optimize speed))
   (if (>= a b) (- a b) (+ (- a b) +p+)))
 
 (defun fneg (a)
@@ -55,325 +52,266 @@
   (if (zerop a) 0 (- +p+ a)))
 
 (defun fmul (a b)
-  (declare (type fp a b))
+  (declare (type fp a b) (optimize speed))
   (mod (* a b) +p+))
 
 (defun fpow (a e)
-  "A^E mod p for an integer A and E >= 0."
+  "A^E mod p, by square and multiply."
   (declare (type (integer 0) e))
-  (let ((r 1) (b (fp-canon a)))
-    (declare (type fp r b))
-    (loop while (plusp e)
-          do (when (oddp e) (setf r (fmul r b)))
-             (setf b (fmul b b) e (ash e -1)))
-    r))
+  (loop with result of-type fp = 1
+        for base of-type fp = (modp a) then (fmul base base)
+        for k = e then (ash k -1)
+        while (plusp k)
+        when (oddp k) do (setf result (fmul result base))
+        finally (return result)))
 
 (defun finv (a)
-  "The inverse of A in F_p.  On zero, signals FIELD-DIVISION-BY-ZERO with the restarts USE-VALUE
-and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp, where 0^(p-2) = 0)."
-  (let ((a (fp-canon a)))
-    (if (zerop a)
+  "1/A in F_p.  The inverse of zero signals FIELD-DIVISION-BY-ZERO, with the restarts USE-VALUE
+and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0)."
+  (let ((a (modp a)))
+    (if (plusp a)
+        (fpow a (- +p+ 2))
         (restart-case (error 'field-division-by-zero :operation 'finv :operands (list a))
-          (use-value (v)
-            :report "Supply the value to use as the inverse."
-            (fp-canon v))
+          (use-value (inverse)
+            :report "Supply the inverse to use."
+            (modp inverse))
           (return-zero ()
-            :report "Return 0, as the Python and C++ implementations do."
-            0))
-        (fpow a (- +p+ 2)))))
+            :report "Return 0, as the Python and C++ code does."
+            0)))))
 
 (defun to-signed (x)
   "The representative of X in (-p/2, p/2]."
-  (let ((x (fp-canon x)))
+  (let ((x (modp x)))
     (if (> x (floor +p+ 2)) (- x +p+) x)))
 
 ;;; ------------------------------------------------------------------ construction
 
-(declaim (inline ext-degree))
-(defun ext-degree (a)
-  (declare (type ext a))
-  (length a))
-
 (defun check-degree (d)
-  "D if it is an extension degree of the tower (4 or 8); else INVALID-PARAMETER (USE-VALUE)."
-  (require-parameter d (lambda (d) (member d '(4 8))) 'extension-degree "4 or 8"))
+  "D, if it is an extension degree of the tower (4 or 8); else INVALID-PARAMETER (USE-VALUE)."
+  (check-parameter d (lambda (d) (typep d 'degree)) "4 or 8")
+  d)
 
-(defun make-ext (d &optional (initial 0))
-  (make-array d :element-type '(unsigned-byte 32) :initial-element initial))
+(defun make-ext (d)
+  "The zero of F_p^D."
+  (make-array d :element-type '(unsigned-byte 32) :initial-element 0))
 
-(defun ext-zero (d) (make-ext d))
+(defun coerce-ext (coordinates)
+  "An EXT from a sequence of integers (any representatives)."
+  (map 'ext #'modp coordinates))
 
-(defun ext-one (d)
-  (let ((r (make-ext d)))
-    (setf (aref r 0) 1)
-    r))
+(defun base->ext (x d)
+  "The base element X in F_p^D."
+  (let ((e (make-ext d)))
+    (setf (aref e 0) (modp x))
+    e))
 
-(defun ext-from-base (d x)
-  (let ((r (make-ext d)))
-    (setf (aref r 0) (fp-canon x))
-    r))
-
-(defun ext-copy (a)
-  (declare (type ext a))
-  (copy-seq a))
-
-(defun ext-coerce (seq &optional d)
-  "A sequence of integers (any representatives) -> an EXT; D, if given, must be its length."
-  (let* ((n (length seq))
-         (r (make-ext n)))
-    (when (and d (/= d n))
-      (error 'invalid-parameter :name 'ext-length :value n :expected d))
-    (map-into r #'fp-canon seq)))
+(defun ext-one (d) (base->ext 1 d))
 
 (defun embed (a &optional (d 8))
-  "An F_p4 element -> F_p8 (zero upper half); an element already of degree D is returned as is."
-  (declare (type ext a))
+  "A as an element of degree D (zero upper coordinates): F_p4 -> F_p8."
   (if (= (length a) d)
       a
-      (let ((r (make-ext d)))
-        (replace r a)
-        r)))
+      (replace (make-ext d) a)))
 
-;;; ------------------------------------------------------------------ elementwise
+;;; ------------------------------------------------------------------ arithmetic
 
-(defun ext= (a b)
-  (declare (type ext a b))
-  (and (= (length a) (length b)) (every #'= a b)))
-
-(macrolet ((elementwise (name op doc)
-             `(defun ,name (a b)
-                ,doc
-                (declare (type ext a b))
-                (let* ((d (length a))
-                       (r (make-ext d)))
-                  (dotimes (i d r)
-                    (setf (aref r i) (,op (aref a i) (aref b i))))))))
-  (elementwise ext+ fadd "A + B.")
-  (elementwise ext- fsub "A - B."))
-
-(defun ext-neg (a)
-  (declare (type ext a))
-  (map 'ext #'fneg a))
+(defun ext= (a b) (equalp a b))
+;; Elementwise operations.
+(macrolet ((define-elementwise (name lambda-list function documentation)
+             `(defun ,name ,lambda-list
+                ,documentation
+                (declare (type ext ,@lambda-list) (optimize speed))
+                (map 'ext ,function ,@lambda-list))))
+  (define-elementwise ext+ (a b) #'fadd "A + B.")
+  (define-elementwise ext- (a b) #'fsub "A - B.")
+  (define-elementwise ext-neg (a) #'fneg "-A."))
 
 (defun ext-scale (a s)
-  "A times the base-field scalar S."
+  "A times the base element S."
   (declare (type ext a))
-  (let ((s (fp-canon s))
-        (r (make-ext (length a))))
-    (dotimes (i (length a) r)
-      (setf (aref r i) (fmul (aref a i) s)))))
+  (let ((s (modp s)))
+    (map 'ext (lambda (x) (fmul x s)) a)))
 
-;;; ------------------------------------------------------------------ the tower
+;;; The tower operations are defined once, recursively, on symbolic coordinates: lists of forms,
+;;; one per coordinate.  Each level is a pair (A0, A1) = A0 + A1 w of elements of the level below,
+;;; where w is the level's generator (x in F_p2, y in F_p4, z in F_p8) and w^2 is the generator of
+;;; the level below (3 in F_p).  DEFINE-TOWER-FUNCTION expands the recursion at compile time into
+;;; straight-line fixnum code for one degree, with every intermediate value bound once.
 
-(declaim (inline f2m))
-(defun f2m (a0 a1 b0 b1)
-  "(a0 + a1 x)(b0 + b1 x) in F_p2."
-  (declare (type fp a0 a1 b0 b1))
-  (values (fadd (fmul a0 b0) (fmul +nonres+ (fmul a1 b1)))
-          (fadd (fmul a0 b1) (fmul a1 b0))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *bindings* '()
+    "The bindings (variable form) of the symbolic computation being expanded, most recent first.")
 
-(defun f4m (a ao b bo r ro)
-  "R[ro..ro+3] = A[ao..ao+3] * B[bo..bo+3] in F_p4 (Karatsuba over F_p2, as zk/fe.py)."
-  (declare (type ext a b r) (type (integer 0 4) ao bo ro))
-  (let ((a0 (aref a ao)) (a1 (aref a (+ ao 1))) (a2 (aref a (+ ao 2))) (a3 (aref a (+ ao 3)))
-        (b0 (aref b bo)) (b1 (aref b (+ bo 1))) (b2 (aref b (+ bo 2))) (b3 (aref b (+ bo 3))))
-    (multiple-value-bind (x0 x1) (f2m a0 a1 b0 b1)
-      (multiple-value-bind (y0 y1) (f2m a2 a3 b2 b3)
-        (multiple-value-bind (m0 m1) (f2m (fadd a0 a2) (fadd a1 a3) (fadd b0 b2) (fadd b1 b3))
-          ;; y * x = 3 y1 + y0 x
-          (setf (aref r ro) (fadd x0 (fmul +nonres+ y1))
-                (aref r (+ ro 1)) (fadd x1 y0)
-                (aref r (+ ro 2)) (fsub (fsub m0 x0) y0)
-                (aref r (+ ro 3)) (fsub (fsub m1 x1) y1))))))
-  r)
+  (defun bind (coordinates)
+    "Bind each coordinate form to a fresh variable; return the variables."
+    (loop for form in coordinates
+          collect (let ((variable (gensym "C")))
+                    (push (list variable form) *bindings*)
+                    variable)))
 
-(defun f4-mul-y (a ao r ro)
-  "R[ro..] = A[ao..] * y in F_p4: (a0, a1, a2, a3) -> (3 a3, a2, a0, a1)."
-  (declare (type ext a r) (type (integer 0 4) ao ro))
-  (let ((a0 (aref a ao)) (a1 (aref a (+ ao 1))) (a2 (aref a (+ ao 2))) (a3 (aref a (+ ao 3))))
-    (setf (aref r ro) (fmul +nonres+ a3)
-          (aref r (+ ro 1)) a2
-          (aref r (+ ro 2)) a0
-          (aref r (+ ro 3)) a1))
-  r)
+  (defun split (a)
+    "The constant term and the top coefficient of A, two elements of the level below."
+    (let ((h (floor (length a) 2)))
+      (values (subseq a 0 h) (subseq a h))))
 
-(defun ext-mul-y (a)
-  "A * y, for A in F_p4."
-  (f4-mul-y a 0 (make-ext 4) 0))
+  (defun add* (a b) (mapcar (lambda (x y) `(fadd ,x ,y)) a b))
+  (defun sub* (a b) (mapcar (lambda (x y) `(fsub ,x ,y)) a b))
+  (defun neg* (a) (mapcar (lambda (x) `(fneg ,x)) a))
+
+  (defun mul-by-generator* (a)
+    "A w, for w the generator of A's level: (A0 + A1 w) w = A1 w^2 + A0 w."
+    (if (rest a)
+        (multiple-value-bind (a0 a1) (split a)
+          (append (mul-by-generator* a1) a0))
+        (list `(fmul +nonres+ ,(first a)))))
+
+  (defun mul* (a b)
+    "A B, by Karatsuba:
+  (A0 + A1 w)(B0 + B1 w) = (A0 B0 + A1 B1 w^2) + ((A0 + A1)(B0 + B1) - A0 B0 - A1 B1) w."
+    (if (rest a)
+        (multiple-value-bind (a0 a1) (split a)
+          (multiple-value-bind (b0 b1) (split b)
+            (let ((lo (bind (mul* a0 b0)))
+                  (hi (bind (mul* a1 b1)))
+                  (mid (bind (mul* (bind (add* a0 a1)) (bind (add* b0 b1))))))
+              (append (add* lo (mul-by-generator* hi))
+                      (sub* (sub* mid lo) hi)))))
+        (list `(fmul ,(first a) ,(first b)))))
+
+  (defun inv* (a)
+    "1/A for nonzero A: (A0 + A1 w)^-1 = (A0 - A1 w) / (A0^2 - A1^2 w^2), the norm one level down."
+    (if (rest a)
+        (multiple-value-bind (a0 a1) (split a)
+          (let ((norm-inverse (bind (inv* (bind (sub* (mul* a0 a0) (mul-by-generator* (mul* a1 a1))))))))
+            (append (mul* a0 norm-inverse) (neg* (mul* a1 norm-inverse)))))
+        (list `(finv ,(first a))))))
+
+(defmacro define-tower-function (name degree lambda-list symbolic-function)
+  "Define NAME, a function of the EXTs of degree DEGREE in LAMBDA-LIST, whose coordinates are
+those computed by SYMBOLIC-FUNCTION (MUL* or INV*) on the arguments' coordinates."
+  (let* ((*bindings* '())
+         (result (apply symbolic-function
+                        (mapcar (lambda (argument)
+                                  (bind (loop for i below degree collect `(aref ,argument ,i))))
+                                lambda-list)))
+         (bindings (reverse *bindings*)))
+    `(defun ,name ,lambda-list
+       (declare (type ext ,@lambda-list) (optimize speed))
+       (let* ,bindings
+         (declare (type fp ,@(mapcar #'first bindings)))
+         (let ((result (make-ext ,degree)))
+           (setf ,@(loop for form in result
+                         for i from 0
+                         append `((aref result ,i) ,form)))
+           result)))))
+
+(define-tower-function mul-4 4 (a b) mul*)
+(define-tower-function mul-8 8 (a b) mul*)
+(define-tower-function inv-4 4 (a) inv*)
+(define-tower-function inv-8 8 (a) inv*)
 
 (defun ext* (a b)
-  "A * B in F_p4 or F_p8."
-  (declare (type ext a b))
-  (let ((d (length a)))
-    (unless (= d (length b))
-      (error 'invalid-parameter :name 'operand-degree :value (length b) :expected d))
-    (case d
-      (4 (f4m a 0 b 0 (make-ext 4) 0))
-      (8 (let ((x (make-ext 4)) (y (make-ext 4)) (m (make-ext 4)) (yu (make-ext 4))
-               (s0 (make-ext 4)) (s1 (make-ext 4)) (r (make-ext 8)))
-           (declare (dynamic-extent x y m yu s0 s1))
-           (dotimes (i 4)
-             (setf (aref s0 i) (fadd (aref a i) (aref a (+ i 4)))
-                   (aref s1 i) (fadd (aref b i) (aref b (+ i 4)))))
-           (f4m a 0 b 0 x 0)
-           (f4m a 4 b 4 y 0)
-           (f4m s0 0 s1 0 m 0)
-           (f4-mul-y y 0 yu 0)
-           (dotimes (i 4 r)
-             (setf (aref r i) (fadd (aref x i) (aref yu i))
-                   (aref r (+ i 4)) (fsub (fsub (aref m i) (aref x i)) (aref y i))))))
-      (t (check-degree d)))))
-
-(defun f2inv (a0 a1)
-  (declare (type fp a0 a1))
-  (let ((n (finv (fsub (fmul a0 a0) (fmul +nonres+ (fmul a1 a1))))))
-    (values (fmul a0 n) (fmul (fneg a1) n))))
-
-(defun f4inv (a ao r ro)
-  "R[ro..] = 1 / A[ao..] in F_p4: (A0 + A1 y)^-1 = (A0 - A1 y) / (A0^2 - x A1^2)."
-  (declare (type ext a r) (type (integer 0 4) ao ro))
-  (let ((a0 (aref a ao)) (a1 (aref a (+ ao 1))) (a2 (aref a (+ ao 2))) (a3 (aref a (+ ao 3))))
-    (multiple-value-bind (s0 s1) (f2m a0 a1 a0 a1)
-      (multiple-value-bind (t0 t1) (f2m a2 a3 a2 a3)
-        (multiple-value-bind (i0 i1) (f2inv (fsub s0 (fmul +nonres+ t1)) (fsub s1 t0))
-          (multiple-value-bind (c0 c1) (f2m a0 a1 i0 i1)
-            (multiple-value-bind (d0 d1) (f2m a2 a3 i0 i1)
-              (setf (aref r ro) c0
-                    (aref r (+ ro 1)) c1
-                    (aref r (+ ro 2)) (fneg d0)
-                    (aref r (+ ro 3)) (fneg d1))))))))
-  r)
-
-(defun %ext-inv (a)
-  (declare (type ext a))
-  (case (length a)
-    (4 (f4inv a 0 (make-ext 4) 0))
-    (8 (let ((aa (make-ext 4)) (bb (make-ext 4)) (bu (make-ext 4)) (n (make-ext 4)) (ni (make-ext 4))
-             (r (make-ext 8)))
-         (f4m a 0 a 0 aa 0)
-         (f4m a 4 a 4 bb 0)
-         (f4-mul-y bb 0 bu 0)
-         (dotimes (i 4) (setf (aref n i) (fsub (aref aa i) (aref bu i))))
-         (f4inv n 0 ni 0)
-         (f4m a 0 ni 0 r 0)
-         (f4m a 4 ni 0 r 4)
-         (loop for i from 4 below 8 do (setf (aref r i) (fneg (aref r i))))
-         r))
-    (t (check-degree (length a)))))
+  "A B in F_p4 or F_p8."
+  (ecase (length a)
+    (4 (mul-4 a b))
+    (8 (mul-8 a b))))
 
 (defun ext-inv (a)
-  "1 / A.  On zero, signals FIELD-DIVISION-BY-ZERO with the restarts USE-VALUE and RETURN-ZERO."
-  (declare (type ext a))
-  (if (every #'zerop a)
+  "1/A.  The inverse of zero signals FIELD-DIVISION-BY-ZERO, with the restarts USE-VALUE and
+RETURN-ZERO."
+  (if (some #'plusp a)
+      (ecase (length a)
+        (4 (inv-4 a))
+        (8 (inv-8 a)))
       (restart-case (error 'field-division-by-zero :operation 'ext-inv :operands (list a))
-        (use-value (v)
-          :report "Supply the value to use as the inverse."
-          (ext-coerce v (length a)))
+        (use-value (inverse)
+          :report "Supply the inverse to use."
+          (coerce-ext inverse))
         (return-zero ()
-          :report "Return 0, as the Python and C++ implementations do."
-          (make-ext (length a))))
-      (%ext-inv a)))
+          :report "Return 0, as the Python and C++ code does."
+          (make-ext (length a))))))
 
 (defun ext-expt (a e)
-  (declare (type ext a) (type (integer 0) e))
-  (let ((r (ext-one (length a))) (b a))
-    (loop while (plusp e)
-          do (when (oddp e) (setf r (ext* r b)))
-             (setf b (ext* b b) e (ash e -1)))
-    r))
+  (loop with result = (ext-one (length a))
+        for base = a then (ext* base base)
+        for k = e then (ash k -1)
+        while (plusp k)
+        when (oddp k) do (setf result (ext* result base))
+        finally (return result)))
 
 ;;; ------------------------------------------------------------------ multilinear helpers
 
 (defun ext-eq1 (a b)
-  "eq(a, b) = a b + (1 - a)(1 - b) = 2ab - a - b + 1."
-  (let* ((ab (ext* a b))
-         (r (make-ext (length a))))
-    (dotimes (i (length a))
-      (setf (aref r i) (fsub (fsub (fadd (aref ab i) (aref ab i)) (aref a i)) (aref b i))))
-    (setf (aref r 0) (fadd (aref r 0) 1))
-    r))
+  "eq(a, b) = a b + (1 - a)(1 - b)."
+  (let ((one (ext-one (length a))))
+    (ext+ (ext* a b) (ext* (ext- one a) (ext- one b)))))
 
 (defun ext-eq (as bs d)
-  "prod_k eq(a_k, b_k) over two sequences of EXTs of degree D."
-  (let ((r (ext-one d)))
-    (map nil (lambda (a b) (setf r (ext* r (ext-eq1 a b)))) as bs)
-    r))
+  "prod_k eq(a_k, b_k)."
+  (reduce #'ext* (map 'list #'ext-eq1 as bs) :initial-value (ext-one d)))
 
 (defun ext-dot (as bs d)
-  (let ((r (ext-zero d)))
-    (map nil (lambda (a b) (setf r (ext+ r (ext* a b)))) as bs)
-    r))
+  "sum_k a_k b_k."
+  (reduce #'ext+ (map 'list #'ext* as bs) :initial-value (make-ext d)))
 
 (defvar *lagrange-weights* (make-hash-table)
-  "d -> the barycentric weights 1 / prod_{j /= i} (i - j) of the nodes 0..d.")
+  "d -> the weights 1 / prod_{j /= i} (i - j) of the nodes 0..d.")
 
-(defun lagrange-weights (d)
-  (or (gethash d *lagrange-weights*)
-      (setf (gethash d *lagrange-weights*)
-            (coerce (loop for i from 0 to d
-                          collect (finv (let ((den 1))
-                                          (loop for j from 0 to d
-                                                unless (= i j) do (setf den (fmul den (fp-canon (- i j)))))
-                                          den)))
-                    'simple-vector))))
+(defun lagrange-weight (i d)
+  (aref (or (gethash d *lagrange-weights*)
+            (setf (gethash d *lagrange-weights*)
+                  (coerce (loop for i from 0 to d
+                                collect (finv (reduce #'fmul (loop for j from 0 to d
+                                                                    unless (= i j) collect (modp (- i j)))
+                                                      :initial-value 1)))
+                          'vector)))
+        i))
 
-(defun lagrange (vals x)
-  "The polynomial of degree <= d through VALS at 0..d (a sequence of EXTs), evaluated at X."
-  (let* ((vals (coerce vals 'simple-vector))
-         (d (1- (length vals)))
-         (deg (length x))
-         (w (lagrange-weights d))
-         (xm (make-array (1+ d)))
-         (pre (make-array (1+ d)))
-         (res (ext-zero deg))
-         (suf (ext-one deg)))
-    (dotimes (j (1+ d))
-      (let ((v (ext-copy x)))
-        (setf (aref v 0) (fsub (aref x 0) (fp-canon j))
-              (aref xm j) v)))
-    (setf (aref pre 0) (ext-one deg))
-    (dotimes (j d)
-      (setf (aref pre (1+ j)) (ext* (aref pre j) (aref xm j))))
-    (loop for i from d downto 0
-          do (setf res (ext+ res (ext-scale (ext* (ext* (aref pre i) suf) (aref vals i)) (aref w i)))
-                   suf (ext* suf (aref xm i))))
-    res))
+(defun lagrange (values x)
+  "The polynomial of degree d through VALUES (d + 1 EXTs) at the nodes 0..d, evaluated at X:
+  sum_i w_i v_i prod_{j /= i} (x - j)."
+  (let* ((d (1- (length values)))
+         (x-minus (loop for j from 0 to d collect (ext- x (base->ext j (length x))))))
+    (reduce #'ext+
+            (loop for v in (coerce values 'list)
+                  for i from 0
+                  collect (ext-scale (reduce #'ext* (loop for factor in x-minus
+                                                          for j from 0
+                                                          unless (= i j) collect factor)
+                                             :initial-value v)
+                                     (lagrange-weight i d))))))
 
 (defun eq-table (r d)
-  "eq(r, x) for x in {0,1}^k as a vector of 2^k EXTs; x's bit 0 (LSB) pairs with r_0."
-  (let* ((k (length r))
-         (v (make-array (ash 1 k))))
-    (setf (aref v 0) (ext-one d))
-    (dotimes (b k v)
-      (let ((rb (elt r b))
-            (h (ash 1 b)))
-        (dotimes (x h)
-          (let ((tt (ext* (aref v x) rb)))
-            (setf (aref v (+ x h)) tt
-                  (aref v x) (ext- (aref v x) tt))))))))
+  "eq(r, x) for every x in {0,1}^k, a vector of 2^k EXTs indexed by x (x's bit 0 pairs with r_0).
+Each variable doubles the table: entry e becomes e (1 - r_b) in the lower half and e r_b in the
+upper half."
+  (let ((table (vector (ext-one d))))
+    (map nil (lambda (rb)
+               (let ((upper (map 'vector (lambda (e) (ext* e rb)) table)))
+                 (setf table (concatenate 'vector (map 'vector #'ext- table upper) upper))))
+         r)
+    table))
 
-(defun mle-eval (vals r d)
-  "The multilinear extension of VALS (2^k base integers or EXTs) at R (k EXTs), LSB first."
-  (let* ((k (length r))
-         (n (length vals))
-         (cur (map 'simple-vector (lambda (v) (if (integerp v) (ext-from-base d v) v)) vals)))
-    (unless (= n (ash 1 k))
-      (error 'invalid-parameter :name 'mle-length :value n :expected (format nil "2^~D" k)))
-    (dotimes (j k (aref cur 0))
-      (let* ((rj (elt r j))
-             (m (ash (length cur) -1))
-             (nxt (make-array m)))
-        (dotimes (i m)
-          (let ((lo (aref cur (* 2 i))) (hi (aref cur (1+ (* 2 i)))))
-            (setf (aref nxt i) (ext+ lo (ext* (ext- hi lo) rj)))))
-        (setf cur nxt)))))
+(defun fold-table (table r)
+  "Bind the lowest variable of the multilinear TABLE (a vector of EXTs) to R: each pair (lo, hi)
+becomes lo + r (hi - lo)."
+  (coerce (loop for (lo hi) on (coerce table 'list) by #'cddr
+                collect (ext+ lo (ext* r (ext- hi lo))))
+          'vector))
+
+(defun mle-eval (values r d)
+  "The multilinear extension of VALUES (2^k base integers or EXTs) at R (k EXTs, LSB first)."
+  (check-parameter values (lambda (v) (= (length v) (expt 2 (length r))))
+                   (format nil "~D values" (expt 2 (length r))))
+  (let ((table (map 'vector (lambda (v) (if (integerp v) (base->ext v d) v)) values)))
+    (aref (reduce #'fold-table r :initial-value table) 0)))
 
 (defun check-tower ()
-  "The irreducibility facts behind the tower (zk/field.py check_tower); signals on failure."
-  (assert (and (= 1 (mod +p+ 4)) (= (1- +p+) (* (expt 2 24) 127))))
-  ;; 3 is a non-square, so X^(2^k) - 3 is irreducible for every k (p = 1 mod 4)
+  "The facts behind the tower (zk/field.py check_tower)."
+  (assert (= (1- +p+) (* (expt 2 24) 127)))
+  ;; 3 is not a square, so X^(2^k) - 3 is irreducible for every k (as p = 1 mod 4)
   (assert (= (fpow +nonres+ (floor (1- +p+) 2)) (1- +p+)))
   (let ((z (make-ext 8)))
     (setf (aref z 4) 1)
-    (assert (ext= (ext-expt z 8) (ext-from-base 8 3))))
+    (assert (ext= (ext-expt z 8) (base->ext 3 8))))
   t)
