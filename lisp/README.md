@@ -88,6 +88,34 @@ Best of 7 runs, F_p^8:
 These runs are close to the timer's 4 ms resolution. On 18 variables (best of 3), the split eq
 takes 3 extension tables from 0.452 s to 0.424 s, and 3 base tables from 0.292 s to 0.244 s.
 
+**Small values (step 6).** While every table is in the base field and the statement has no
+constants, the first ℓ0 rounds (`*small-value-rounds*`, 3 by default) don't fold the tables.
+This follows Bagad, Dao, Domb and Thaler, ePrint 2025/1117.
+
+1. One pass over the base tables computes accumulators A[z] = Σ_y eq(r_tail, y) F(tables(z, y))
+   for every z on the grid {0..d}^ℓ0, where d is the statement's degree in the tables. The
+   statement is evaluated in base-field arithmetic, and only the eq weighting is in the extension.
+2. Each of the ℓ0 round messages is interpolated from A with Lagrange weights of the challenges
+   so far.
+3. The tables are then bound to all ℓ0 challenges at once, and the round kernels take over.
+
+The messages are the same field elements as the folding rounds produce, and a test checks that the
+proofs are identical byte for byte. `small-value-code` returns the pass as a `lambda` form. The
+grid extension is unrolled into in-place `setf`s, so a kernel compiles in about 0.5 s (degree 3,
+ℓ0 = 3). Kernels above `*small-value-size-limit*` step down to a smaller ℓ0, or to folding.
+
+Base tables, best of 3:
+
+| Prover run | Folding | Small values, ℓ0 = 3 |
+|---|---|---|
+| 3 tables, 16 variables, F_p^8 | 0.064 s, 7.4 MB | 0.040 s, 2.6 MB |
+| 3 tables, 18 variables, F_p^8 | 0.240 s, 28.8 MB | 0.172 s, 9.8 MB |
+| 2 tables, 18 variables, F_p^8 | 0.132 s, 19.4 MB | 0.080 s, 6.6 MB |
+| 3 tables, 18 variables, F_p^4 | 0.120 s, 16.1 MB | 0.104 s, 6.6 MB |
+
+That is 1.4–1.65× in F_p^8 and 1.15× in F_p^4. The cost model of ePrint 2024/1046 predicts 1.85×
+and 1.31× at degree 2.
+
 The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
 on symbolic coordinates:
 
@@ -123,7 +151,7 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `transcript.lisp` | `zk/transcript.py` | the Fiat-Shamir transcript |
 | `proofio.lisp` | `zk/proofio.py` | the proof byte format (`SABLEPF1`) |
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code |
-| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`) and base tables kept in the base field until their first fold |
+| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with one compiled round kernel per statement (`round-kernel-code`), split eq weights, and the first rounds of base tables answered from small-value accumulators (`small-value-code`) |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that

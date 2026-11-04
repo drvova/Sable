@@ -16,7 +16,8 @@
 (defpackage #:sable.sumcheck
   (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.forms #:sable.transcript)
   (:export #:header #:statement-degree #:hypercube-sum #:prove #:verify #:next-claim
-           #:check-final #:round-kernel-code #:*kernel-size-limit* #:demo))
+           #:check-final #:round-kernel-code #:*kernel-size-limit* #:small-value-code
+           #:*small-value-rounds* #:*small-value-size-limit* #:demo))
 
 (in-package #:sable.sumcheck)
 
@@ -311,33 +312,239 @@ uses GENERIC-ROUND-SUMS (compiling a huge straight-line function takes longer th
               :element-type '(unsigned-byte 32)
               :initial-contents (mapcar (lambda (sum) (coerce sum 'list)) sums)))
 
+;;; ------------------------------------------------------------------ small values
+;;;
+;;; The small-value prover (Bagad, Dao, Domb and Thaler, "Speeding Up Sum-Check Proving", ePrint
+;;; 2025/1117).  While every table is in the base field, the first L0 rounds need not fold the
+;;; tables into the extension.  Write the variables as (z, y), z the first L0 of them and y the
+;;; rest.  Each table is multilinear in z and the statement has degree d in the tables, so F's
+;;; value at bound challenges rho is a polynomial of degree at most d in each rho_t, and is the
+;;; Lagrange interpolation of its values on the grid {0..d}^L0.  One pass over the base tables
+;;; therefore computes the accumulators
+;;;
+;;;   A[z] = sum_y eq(r_tail, y) F(tables(z, y))          for every z in {0..d}^L0,
+;;;
+;;; with F evaluated in base-field arithmetic and only the weighting by eq in the extension.  Round
+;;; j < L0 then reads its message off A:
+;;;
+;;;   g_j(X) = sum_{v in {0..d}^j} L_v(rho_0..rho_{j-1}) sum_{u in {0,1}^(L0-1-j)} eq(r_u, u) A[v, X, u]
+;;;
+;;; and after round L0 - 1 the tables are bound to all L0 challenges at once (BIND-PREFIX).  The
+;;; messages are the same field elements as the folding rounds', so the proof is the same.
+
+(defparameter *small-value-rounds* 3
+  "L0: the number of first rounds the small-value prover answers from its accumulators, at most
+(a smaller L0 is used when the statement's kernel would exceed *SMALL-VALUE-SIZE-LIMIT*).  Below 2 it
+is the same as folding (the first round already runs in the base field).")
+
+(defun grid-code (grid entries offset l0 g)
+  "Straight-line code that fills the array GRID (index sum z_t G^t) with the values on
+{0..G-1}^L0 of the multilinear table whose 2^L0 values on {0,1}^L0 are ENTRIES[OFFSET + b] (bit t
+of b: variable t).  It places them at the grid's 0/1 points, then extends one variable at a time,
+in place: each pair (v0, v1) becomes v0, v1, v1 + s, v1 + 2s, ... for the slope s = v1 - v0.
+Every step is a SETF with one short-lived local, so the code stays cheap to compile."
+  (flet ((position-of (digits)
+           (loop for digit in digits for weight = 1 then (* weight g) sum (* digit weight)))
+         (digit-lists (radices)
+           (let ((lists '(())))
+             (dolist (radix (reverse radices) lists)
+               (setf lists (loop for digit below radix
+                                 append (mapcar (lambda (rest) (cons digit rest)) lists)))))))
+    `(progn
+       ;; the 2^L0 entries at the grid's 0/1 points
+       ,@(loop for b below (expt 2 l0)
+               collect `(setf (aref ,grid ,(position-of (loop for v below l0 collect (ldb (byte 1 v) b))))
+                              (aref ,entries (+ ,offset ,b))))
+       ;; extend variable v; variables before it already range over the grid, those after over {0,1}
+       ,@(when (> g 2)
+           (loop for v below l0
+                 append (loop for digits in (digit-lists (loop for u below l0
+                                                               collect (cond ((< u v) g) ((= u v) 1) (t 2))))
+                              collect (let ((at (lambda (x) (position-of (append (subseq digits 0 v)
+                                                                                 (list x)
+                                                                                 (subseq digits (1+ v)))))))
+                                        `(let ((slope (fsub (aref ,grid ,(funcall at 1))
+                                                            (aref ,grid ,(funcall at 0)))))
+                                           ,@(loop for x from 2 below g
+                                                   collect `(setf (aref ,grid ,(funcall at x))
+                                                                  (fadd (aref ,grid ,(funcall at (1- x)))
+                                                                        slope)))))))))))
+
+(defun small-value-code (statement table-names d l0 g)
+  "The LAMBDA form of the small-value prover's pass for STATEMENT: a function of the base tables
+(in the order of TABLE-NAMES) and the LOW and HIGH eq weights of the variables after the first L0,
+returning the accumulators A[z] for z in {0..G-1}^L0, a vector of EXTs.  For each y, the tables'
+grid values come from unrolled straight-line code (GRID-CODE); a loop over the grid evaluates the
+statement in base-field arithmetic and adds it, weighted, to the accumulators."
+  (let* ((size (expt g l0))
+         (block (expt 2 l0))
+         (n-tables (length table-names))
+         (tables (gensym "TABLES")) (low (gensym "LOW")) (high (gensym "HIGH"))
+         (h (gensym "H")) (l (gensym "L")) (y (gensym "Y")) (z (gensym "Z")) (w (gensym "W"))
+         (value (gensym "VALUE")) (inner (gensym "INNER")) (outer (gensym "OUTER"))
+         (term (gensym "TERM"))
+         (table-vars (loop repeat n-tables collect (gensym "TABLE")))
+         (entries (loop repeat n-tables collect (gensym "ENTRIES")))
+         (grids (loop repeat n-tables collect (gensym "GRID"))))
+    `(lambda (,tables ,low ,high)
+       (declare (type list ,tables) (type simple-vector ,low ,high) (optimize speed)
+                (sb-ext:muffle-conditions sb-ext:compiler-note))
+       (destructuring-bind ,table-vars ,tables
+         (let* (,@(loop for table in table-vars for e in entries
+                        collect `(,e (table-entries ,table)))
+                ,@(loop for grid in grids collect `(,grid (make-ext ,size)))
+                (,inner (make-array ,size))
+                (,outer (make-array ,size))
+                (,term (make-ext ,d)))
+           (declare (type ext ,@entries ,@grids) (type simple-vector ,inner ,outer))
+           (dotimes (,z ,size)
+             (setf (svref ,inner ,z) (make-ext ,d)
+                   (svref ,outer ,z) (make-ext ,d)))
+           (dotimes (,h (length ,high))
+             (dotimes (,z ,size) (fill (the ext (svref ,inner ,z)) 0))
+             (dotimes (,l (length ,low))
+               (let ((,y (+ (* ,h (length ,low)) ,l))
+                     (,w (svref ,low ,l)))
+                 (declare (type fixnum ,y) (type ext ,w))
+                 ,@(loop for grid in grids for e in entries
+                         collect (grid-code grid e `(* ,y ,block) l0 g))
+                 (dotimes (,z ,size)
+                   (let ((,value (let ,(loop for name in table-names for grid in grids
+                                             collect `(,name (aref ,grid ,z)))
+                                   ,(arithmetic-form statement)))
+                         (acc (svref ,inner ,z)))
+                     (declare (type fp ,value) (type ext acc))
+                     ;; acc += w value: D base products
+                     (dotimes (c ,d)
+                       (setf (aref acc c) (fadd (aref acc c) (fmul (aref ,w c) ,value))))))))
+             (dotimes (,z ,size)
+               (let ((acc (svref ,outer ,z)))
+                 (ext+ acc (ext* (svref ,high ,h) (svref ,inner ,z) ,term) acc))))
+           ,outer)))))
+
+(defparameter *small-value-size-limit* 5000
+  "The largest small-value kernel, in conses of its code, that SMALL-VALUE-KERNEL compiles.  The
+grid has G^L0 points per table, and compiling grows faster than the code: about 0.5 s at 4,000
+conses (G = 4, L0 = 3) but 10 s at 16,000 (L0 = 4).")
+
+(defvar *small-value-kernels* (make-hash-table :test 'equal)
+  "(statement table-names d l0 g) -> the compiled SMALL-VALUE-CODE.")
+
+(defun small-value-kernel (statement table-names d l0 g)
+  "SMALL-VALUE-CODE compiled, once per statement and shape; NIL if its code would be larger than
+*SMALL-VALUE-SIZE-LIMIT*."
+  (let ((key (list statement table-names d l0 g *small-value-size-limit*)))
+    (multiple-value-bind (kernel found) (gethash key *small-value-kernels*)
+      (if found
+          kernel
+          (setf (gethash key *small-value-kernels*)
+                (and (<= (* (expt g l0) (length table-names)) *small-value-size-limit*) ; cheap bound first
+                     (let ((code (small-value-code statement table-names d l0 g)))
+                       (and (<= (code-size code) *small-value-size-limit*)
+                            (compile nil code)))))))))
+
+(defun choose-small-value-kernel (statement table-names d n g)
+  "The largest L0 from *SMALL-VALUE-ROUNDS* down to 2 (and at most N) whose kernel fits, with the
+kernel; or NIL, to fold from the first round."
+  (loop for l0 from (min *small-value-rounds* n) downto 2
+        for kernel = (small-value-kernel statement table-names d l0 g)
+        when kernel return (values l0 kernel)))
+
+(defun lagrange-basis (x g)
+  "L_a(X) for the nodes a = 0..G-1, as a list of EXTs."
+  (let ((d (length x)))
+    (loop for a below g
+          collect (lagrange (loop for b below g collect (if (= a b) (ext-one d) (make-ext d))) x))))
+
+(defun lagrange-tensor (rhos g d)
+  "L_v(rho) = prod_t L_{v_t}(rho_t) for every v in {0..G-1}^|RHOS|, indexed by sum v_t G^t."
+  (let ((tensor (vector (ext-one d))))
+    (dolist (rho rhos tensor)
+      (let ((basis (lagrange-basis rho g))
+            (next (make-array (* g (length tensor)))))
+        (loop for la in basis
+              for a from 0
+              do (loop for lv across tensor
+                       for v from 0
+                       do (setf (svref next (+ v (* (length tensor) a))) (ext* lv la))))
+        (setf tensor next)))))
+
+(defun radix (bits g)
+  "The integer whose base-G digits are the binary digits of BITS."
+  (loop for b below (integer-length bits)
+        sum (* (ldb (byte 1 b) bits) (expt g b))))
+
+(defun small-value-sums (accumulators j l0 g points rhos eq d)
+  "Round J's sums at the EVALUATION-POINTS, from the accumulators and the challenges RHOS so far."
+  (let ((lagrange (lagrange-tensor rhos g d))
+        (eqs (weights eq (1+ j) l0 d))
+        (term (make-ext d)))
+    (loop for x in (evaluation-points points)
+          collect (let ((sum (make-ext d)))
+                    (loop for lv across lagrange
+                          for v from 0
+                          do (loop for e across eqs
+                                   for u from 0
+                                   for z = (+ v (* (expt g j) x) (* (expt g (1+ j)) (radix u g)))
+                                   do (ext+ sum (ext* (ext* lv e term) (svref accumulators z) term) sum)))
+                    sum))))
+
+(defun bind-prefix (table rhos d)
+  "The base TABLE with its first |RHOS| variables bound to RHOS: entry y becomes
+sum_b eq(rhos, b) T(b, y), D base products per term."
+  (let* ((block (expt 2 (length rhos)))
+         (eqs (eq-table rhos d))
+         (size (floor (table-size table) block))
+         (entries (table-entries table))
+         (bound (make-ext (* d size)))
+         (acc (make-ext d))
+         (term (make-ext d)))
+    (dotimes (y size (%make-table d bound))
+      (fill acc 0)
+      (dotimes (b block)
+        (ext+ acc (ext-scale (svref eqs b) (aref entries (+ (* y block) b)) term) acc))
+      (replace bound acc :start1 (* d y)))))
+
 (defun prove (tr n statement tables &key eq constants (label "sc"))
   "Prove the sumcheck of STATEMENT on the prover transcript TR (a reference prover, on the CPU).
-TABLES: an alist (variable . 2^N base elements or EXTs); base tables stay in the base field until
-the first fold.  Each round runs the statement's compiled ROUND-KERNEL, with the eq weights split
-in two (SPLIT-WEIGHTS).  Returns the round
-challenges and the finals, an alist (variable . EXT at the challenges) for CHECK-FINAL."
+TABLES: an alist (variable . 2^N base elements or EXTs).  With base tables and no constants, the
+first *SMALL-VALUE-ROUNDS* rounds come from one base-field pass (small values); the others run the
+statement's compiled ROUND-KERNEL, with the eq weights split in two (SPLIT-WEIGHTS).  Returns the
+round challenges and the finals, an alist (variable . EXT at the challenges) for CHECK-FINAL."
   (let* ((d (transcript-degree tr))
          (points (max (statement-degree statement constants) 1))
          (names (mapcar #'car tables))
          (constant-names (mapcar #'car constants))
          (constant-values (mapcar #'cdr constants))
-         (flat (loop for (nil . values) in tables collect (make-table values d))))
+         (flat (loop for (nil . values) in tables collect (make-table values d)))
+         (g (1+ points))
+         (rhos '()))
     (absorb tr (header label n (statement-degree statement constants)))
-    (values (loop for j below n
-                  collect (multiple-value-bind (low high) (split-weights eq (1+ j) n d)
-                            (let* ((base (and (null constants)
-                                              (every (lambda (table) (= (table-stride table) 1)) flat)))
-                                   (kernel (round-kernel statement names constant-names d points base))
-                                   (sums (if kernel
-                                             (apply kernel flat low high constant-values)
-                                             (generic-round-sums
-                                              (statement-function statement tables constants d)
-                                              flat constant-values low high points d))))
-                              (send tr (round-message sums points d))
-                              (let ((r (challenge tr)))
-                                (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
-                                r))))
+    (multiple-value-bind (l0 kernel)
+        (and (null constants)
+             (every (lambda (table) (= (table-stride table) 1)) flat)
+             (choose-small-value-kernel statement names d n g))
+      (when kernel
+        (let ((accumulators (multiple-value-call kernel flat (split-weights eq l0 n d))))
+          (dotimes (j l0)
+            (send tr (round-message (small-value-sums accumulators j l0 g points rhos eq d) points d))
+            (setf rhos (append rhos (list (challenge tr)))))
+          (setf flat (mapcar (lambda (table) (bind-prefix table rhos d)) flat)))))
+    (values (append rhos
+                    (loop for j from (length rhos) below n
+                          collect (multiple-value-bind (low high) (split-weights eq (1+ j) n d)
+                                    (let* ((base (and (null constants)
+                                                      (every (lambda (table) (= (table-stride table) 1)) flat)))
+                                           (kernel (round-kernel statement names constant-names d points base))
+                                           (sums (if kernel
+                                                     (apply kernel flat low high constant-values)
+                                                     (generic-round-sums
+                                                      (statement-function statement tables constants d)
+                                                      flat constant-values low high points d))))
+                                      (send tr (round-message sums points d))
+                                      (let ((r (challenge tr)))
+                                        (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
+                                        r)))))
             (loop for name in names
                   for table in flat
                   collect (cons name (table-entry table 0 (make-ext d)))))))

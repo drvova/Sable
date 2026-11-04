@@ -21,6 +21,10 @@
     (unless (uiop:symbol-call '#:sable.tests '#:run-tests)
       (format *error-output* "~&build: tests failed, no image written~%")
       (sb-ext:exit :code 1))
+    ;; compile the demo's kernels now, so the image's first (demo) does not
+    (let ((*standard-output* (make-broadcast-stream)))
+      (dolist (base '(nil t))
+        (uiop:symbol-call '#:sable.sumcheck '#:demo :variables 6 :base base)))
     ;; forget where the sources were, so the image does not try to reload them
     (asdf:clear-configuration)
     (format t "~&build: writing ~A~%" out)

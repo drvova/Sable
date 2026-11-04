@@ -158,7 +158,7 @@ and RETURN-ZERO (the convention of zk/fe.py and zk/cuda/vcore.cpp: 0^(p-2) = 0).
 (defun ext-scale (a s &optional (out (make-ext (length a))))
   "A times the base element S."
   (declare (type ext a out) (optimize speed))
-  (let ((s (modp s)))
+  (let ((s (if (typep s 'fp) s (modp s))))
     (declare (type fp s))
     (dotimes (i (length a) out)
       (setf (aref out i) (fmul (aref a i) s)))))

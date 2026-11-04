@@ -360,3 +360,26 @@
             (assert (equalp (proof) (let ((sable.sumcheck:*kernel-size-limit* 0)) (proof))))))))
     ;; and the kernel is code that can be read
     (assert (eq 'lambda (first (sable.sumcheck:round-kernel-code '(* a b) '(a b) '() 4 2 nil))))))
+
+(defun test-sumcheck-small-values ()
+  ;; the small-value rounds give the same proofs as folding, byte for byte
+  (dolist (d '(4 8))
+    (dolist (case '(((* t0 t1 t2) 5) ((+ (* t0 t1 t2) (* 7 t1) -1) 4) (t0 3) ((* t0 t1) 2)
+                    ((- (expt t0 3) (* t0 t1)) 4) ((* t0 t1 t2 t3) 1)))
+      (destructuring-bind (statement n) case
+        (dolist (with-eq '(t nil))
+          (let* ((state (sb-ext:seed-random-state (+ d n)))
+                 (tables (loop for v in (form-variables statement)
+                               collect (cons v (coerce (loop repeat (expt 2 n) collect (random +p+ state))
+                                                       'vector))))
+                 (eq (and with-eq
+                          (loop repeat n collect (coerce-ext (loop repeat d collect (random +p+ state)))))))
+            (flet ((proof (l0)
+                     (let ((sable.sumcheck:*small-value-rounds* l0)
+                           (tr (make-transcript "small" d)))
+                       (multiple-value-bind (rho finals) (sable.sumcheck:prove tr n statement tables :eq eq)
+                         (list (lists rho) finals (sable.proofio:encode-proof (transcript-messages tr)))))))
+              (let ((folded (proof 0)))
+                (dolist (l0 '(2 3 4))
+                  (assert (equalp (proof l0) folded) () "~S, n = ~D, D = ~D, L0 = ~D, eq ~A"
+                          statement n d l0 with-eq))))))))))
