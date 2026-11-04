@@ -11,6 +11,7 @@ implementation (zk/)."
   :serial t
   :pathname "src/"
   :components ((:file "util")
+               (:file "sha256")
                (:file "conditions")
                (:file "field")
                (:file "forms")
@@ -22,6 +23,7 @@ implementation (zk/)."
                (:file "gkr")
                (:file "domain")
                (:file "pcs")
+               (:file "llm")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "sable/tests"))))
 

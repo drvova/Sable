@@ -743,3 +743,146 @@ tests/check-pcs-python.py, which checks them with zk/gpcs.py's verifier."
                          more))))
     (format out "]~%"))
   path)
+
+;;; ------------------------------------------------------------------ the outer layer of llm.verify
+
+(defparameter *llm-configs*
+  `(("tiny" . ,(sable.llm:make-cfg :l 2 :d 256 :nh 4 :nkv 2 :dh 128 :dff 512 :v 1024))
+    ("tiny3" . ,(sable.llm:make-cfg :l 2 :d 256 :nh 4 :nkv 2 :dh 128 :dff 512 :v 1024 :qk-norm t :qkv-bias nil))
+    ("tiny-moe" . ,(sable.llm:make-cfg :l 2 :d 512 :nh 4 :nkv 2 :dh 128 :dff 128 :v 1024 :qk-norm t :qkv-bias nil
+                                       :moe '(:e 8 :k 2 :de 64)))
+    ("Qwen2.5-32B" . ,(sable.llm:make-cfg :l 64 :d 5120 :nh 40 :nkv 8 :dh 128 :dff 27648 :v 152064))
+    ("Qwen3-32B" . ,(sable.llm:make-cfg :l 64 :d 5120 :nh 64 :nkv 8 :dh 128 :dff 25600 :v 151936
+                                        :qk-norm t :qkv-bias nil))
+    ("Qwen3-30B-A3B" . ,(sable.llm:make-cfg :l 48 :d 2048 :nh 32 :nkv 4 :dh 128 :dff (* 8 768) :v 151936
+                                            :qk-norm t :qkv-bias nil :moe '(:e 128 :k 8 :de 768))))
+  "Configurations: tiny models of the three families, and the paper's three models.")
+
+(defun llm-shape (cfg b s ng)
+  (multiple-value-bind (cb cbv) (sable.llm:column-block-bits cfg)
+    (sable.llm:make-shape cfg b s cb cbv ng)))
+
+(defun json-cfg (cfg)
+  (format nil "{\"L\": ~D, \"d\": ~D, \"nh\": ~D, \"nkv\": ~D, \"dh\": ~D, \"dff\": ~D, \"V\": ~D, \"qk_norm\": ~:[false~;true~], ~
+               \"qkv_bias\": ~:[false~;true~], \"moe\": ~A, \"down_b\": ~D}"
+          (sable.llm::cfg-l cfg) (sable.llm::cfg-d cfg) (sable.llm::cfg-nh cfg) (sable.llm::cfg-nkv cfg)
+          (sable.llm::cfg-dh cfg) (sable.llm::cfg-dff cfg) (sable.llm::cfg-v cfg) (sable.llm::cfg-qk-norm cfg)
+          (sable.llm::cfg-qkv-bias cfg)
+          (let ((moe (sable.llm::cfg-moe cfg)))
+            (if moe (format nil "{\"E\": ~D, \"k\": ~D, \"de\": ~D}" (getf moe :e) (getf moe :k) (getf moe :de)) "null"))
+          (sable.llm::cfg-down-b cfg)))
+
+(defun json-hex (octets) (format nil "\"~(~{~2,'0X~}~)\"" (coerce octets 'list)))
+(defun json-strings (strings) (format nil "[~{\"~A\"~^,~}]" strings))
+(defun json-rows (rows) (format nil "[~{~A~^,~}]" (mapcar #'json-ints rows)))
+
+(defun random-octets (n state)
+  (coerce (loop repeat n collect (random 256 state)) 'octets))
+
+(defun json-policy (p)
+  (format nil "{\"gmax\": ~A, \"stop\": ~A, \"theta\": ~D, \"ctx_bound\": ~A, \"tokenizer\": ~A, \"template\": ~A, ~
+               \"hpre\": ~A, \"autoregressive\": ~:[false~;true~]}"
+          (or (sable.llm::policy-gmax p) "null") (json-ints (sable.llm::policy-stop p)) (sable.llm::policy-theta p)
+          (or (sable.llm::policy-ctx-bound p) "null") (json-hex (sable.llm::policy-tokenizer p))
+          (json-hex (sable.llm::policy-template p)) (json-hex (sable.llm::policy-hpre p))
+          (sable.llm::policy-autoregressive p)))
+
+(defun fed-back-tokens (b s ng v state &key stop-at-end)
+  "B prompts of S tokens whose last ng - 1 are the generated ones, and the targets (ng per row)."
+  (loop repeat b
+        collect (let* ((tokens (loop repeat s collect (random v state)))
+                       (targets (append (nthcdr (1+ (- s ng)) tokens) (list (or stop-at-end (random v state))))))
+                  (list tokens targets))
+          into rows
+        finally (return (values (mapcar #'first rows) (mapcar #'second rows)))))
+
+(defun test-llm-layout ()
+  ;; every layout declares on the commitment, which finds its classes
+  (loop for (name . cfg) in *llm-configs*
+        do (let* ((shape (llm-shape cfg 1 (if (> (sable.llm::cfg-l cfg) 2) 4096 256) 4))
+                  (layout (sable.llm:commitment-layout cfg shape))
+                  (pcs (sable.llm:declare-units (sable.pcs:make-pcs nil) layout)))
+             (assert (= (sable.pcs:pcs-nv pcs) 23) () "~A" name)
+             (assert (= (length (getf layout :merges)) (sable.llm::cfg-l cfg))))))
+
+(defun test-llm-statement-checks ()
+  (let* ((state (sb-ext:seed-random-state 31))
+         (cfg (cdr (assoc "tiny" *llm-configs* :test #'string=)))
+         (shape (llm-shape cfg 2 256 4)))
+    (multiple-value-bind (tokens targets) (fed-back-tokens 2 256 4 1024 state)
+      (assert (sable.llm:check-statement (sable.llm:make-policy) shape tokens targets))
+      (flet ((rejects (policy tokens targets)
+               (assert (signalled 'verification-failure
+                                  (lambda () (sable.llm:check-statement policy shape tokens targets))))))
+        (rejects (sable.llm:make-policy :ctx-bound 128) tokens targets)
+        (rejects (sable.llm:make-policy) (cons (cons 5000 (rest (first tokens))) (rest tokens)) targets)
+        (rejects (sable.llm:make-policy :gmax 8 :stop '(3)) tokens targets)        ; truncated
+        (rejects (sable.llm:make-policy) tokens (list (reverse (first targets)) (second targets)))))))
+
+(defun export-llm-cases (path)
+  "Write layouts, statements, policies, sampling seeds, statement checks and C_W computed by
+llm.lisp as JSON for tests/check-llm-python.py, which recomputes them with zk/llm.py."
+  (let ((state (sb-ext:seed-random-state 41)))
+    (with-open-file (out path :direction :output :if-exists :supersede)
+      (format out "{\"layouts\": [~%")
+      (loop for ((name . cfg) . more) on *llm-configs*
+            do (loop for ((b s ng theta) . more-shapes) on (if (> (sable.llm::cfg-l cfg) 2)
+                                                                 '((1 4096 16 0) (4 4096 16 3) (1 16384 16 0))
+                                                                 '((1 256 4 0) (2 512 8 3) (4 256 16 0)))
+                     do (let ((layout (sable.llm:commitment-layout cfg (llm-shape cfg b s ng) :theta theta)))
+                          (format out "{\"name\": \"~A\", \"cfg\": ~A, \"B\": ~D, \"S\": ~D, \"ng\": ~D, \"theta\": ~D, ~
+                                       \"groups\": [~{~A~^,~}], \"merges\": [~{~A~^,~}], \"segments\": [~{~A~^,~}], ~
+                                       \"weight_groups\": ~A}~:[~;,~]~%"
+                                  name (json-cfg cfg) b s ng theta
+                                  (loop for (g items) in (getf layout :groups)
+                                        collect (format nil "[\"~A\", [~{[\"~A\", ~D, ~D]~^,~}]]" g (apply #'append items)))
+                                  (mapcar #'json-strings (getf layout :merges))
+                                  (mapcar #'json-strings (getf layout :segments))
+                                  (json-strings (getf layout :weight-groups))
+                                  (or more more-shapes)))))
+      (format out "],~%\"statements\": [~%")
+      (loop for ((name . cfg) . more) on (subseq *llm-configs* 0 3)
+            do (loop for (policy . more-policies)
+                       on (list (sable.llm:make-policy)
+                                (sable.llm:make-policy :theta 3 :gmax 8 :stop '(7 3 7) :ctx-bound 1024
+                                                       :tokenizer "qwen-tokenizer" :template "chat"
+                                                       :hpre (random-octets 32 state))
+                                (sable.llm:make-policy :autoregressive nil :theta 10))
+                     do (multiple-value-bind (tokens targets) (fed-back-tokens 2 256 8 1024 state)
+                          (let ((shape (llm-shape cfg 2 256 8))
+                                (c-w (random-octets 32 state)) (constants (random-octets 32 state))
+                                (nonce (random-octets 32 state)) (salt (random-octets 32 state)))
+                            (format out "{\"name\": \"~A\", \"cfg\": ~A, \"B\": 2, \"S\": 256, \"ng\": 8, \"tokens\": ~A, \"targets\": ~A, ~
+                                         \"C_W\": ~A, \"const\": ~A, \"nonce\": ~A, \"salt\": ~A, \"policy\": ~A, ~
+                                         \"policy_bytes\": ~A, \"statement\": ~A, \"seed\": ~A}~:[~;,~]~%"
+                                    name (json-cfg cfg) (json-rows tokens) (json-rows targets)
+                                    (json-hex c-w) (json-hex constants) (json-hex nonce) (json-hex salt) (json-policy policy)
+                                    (json-hex (sable.llm:encode-policy policy))
+                                    (json-hex (sable.llm:statement cfg shape tokens targets c-w constants
+                                                                   :policy policy :nonce nonce :salt salt))
+                                    (json-hex (sable.llm:sampling-seed tokens 8 c-w policy :nonce nonce))
+                                    (or more more-policies))))))
+      (format out "],~%\"checks\": [~%")
+      (let* ((cfg (cdr (first *llm-configs*)))
+             (shape (llm-shape cfg 2 256 4))
+             (cases (multiple-value-bind (tokens targets) (fed-back-tokens 2 256 4 1024 state :stop-at-end 3)
+                      (list (list (sable.llm:make-policy) tokens targets)
+                            (list (sable.llm:make-policy :stop '(3)) tokens targets)
+                            (list (sable.llm:make-policy :stop '(3) :gmax 8) tokens targets)
+                            (list (sable.llm:make-policy :gmax 8) tokens targets)
+                            (list (sable.llm:make-policy :gmax 2) tokens targets)
+                            (list (sable.llm:make-policy :ctx-bound 100) tokens targets)
+                            (list (sable.llm:make-policy :stop (list (first (first targets)))) tokens targets)
+                            (list (sable.llm:make-policy) (cons (cons 1024 (rest (first tokens))) (rest tokens)) targets)
+                            (list (sable.llm:make-policy) tokens (list (reverse (first targets)) (second targets)))
+                            (list (sable.llm:make-policy :autoregressive nil) tokens (list (reverse (first targets)) (second targets)))))))
+        (loop for ((policy tokens targets) . more) on cases
+              do (format out "{\"policy\": ~A, \"tokens\": ~A, \"targets\": ~A, \"ok\": ~:[false~;true~]}~:[~;,~]~%"
+                         (json-policy policy) (json-rows tokens) (json-rows targets)
+                         (handler-case (sable.llm:check-statement policy shape tokens targets)
+                           (verification-failure () nil))
+                         more)))
+      (let ((caps (loop repeat 5 collect (random-octets (* 32 (1+ (random 4 state))) state))))
+        (format out "],~%\"wdigest\": {\"caps\": [~{~A~^,~}], \"digest\": ~A}}~%"
+                (mapcar #'json-hex caps) (json-hex (sable.llm:weights-digest caps)))))
+    path))

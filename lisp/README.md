@@ -155,6 +155,8 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `gkr.lisp` | `zk/gkr.py`, `vc_gkr_upper` in `zk/cuda/vcore.cpp` | batched LogUp-GKR fractional sums: `verify-upper`, a CPU reference prover `prove-upper`, the layer statement as a form |
 | `domain.lisp` | `zk/domain.py` | a domain (columns, zerocheck constraints, lookups) as data; its leaf-layer and zerocheck statement as one form; `verify-domain` and a CPU reference prover `prove-domain` |
 | `pcs.lisp` | `zk/gpcs.py` | the polynomial commitment: units and size classes, merged mixed-height Merkle trees with caps, the per-class point reductions, segments, the cross-unit sumcheck, BaseFold with oracles, grinding and the query checks; a CPU reference prover |
+| `sha256.lisp` | `hashlib.sha256` | SHA-256 (FIPS 180-4), for the statement's digests |
+| `llm.lisp` | the outer layer of `zk/llm.py`, `zk/proto.py` | the transformer protocol's public side: `make-cfg`, `make-shape`, `column-block-bits`, the commitment layout (`commitment-layout`: groups, packing, merge sets, segments, weight groups; `declare-units`), the policy and its encoding, `check-statement`, `statement`, `sampling-seed`, `weights-digest` (C_W) |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
@@ -255,13 +257,36 @@ grinding may still accept, and the empty paths of trees whose cap is their leave
 6 queries and 4 bits of grinding instead of 153 and 30: grinding 30 bits on the CPU takes hours.
 Python's verifier takes both as parameters too.
 
+**The transformer protocol's outer layer.** `llm.lisp` ports the parts of `llm.verify` that
+come before and around the per-layer steps, with the same bytes:
+
+- the statement (`P|` policy, C_W, h_circ from the configuration's `repr`, the shape and the
+  constants digest, H(x), H(y), the nonce, T, the salt), the policy encoding, and the verifier's
+  checks on the public statement (`check-statement`, which signals `verification-failure` where
+  `Policy.check` raises)
+- the sampling seed, and C_W from the weight groups' caps
+- the commitment layout: every group of every layer with Python's packing of small blocks into
+  columns, the MoE expert groups, the merge sets, the segments and the weight groups;
+  `declare-units` declares them on a `make-pcs` verifier in Python's order
+
+`make crosscheck` compares them with `zk/llm.py`: 18 layouts (the tiny test models, and
+Qwen2.5-32B, Qwen3-32B and Qwen3-30B-A3B at the paper's shapes, up to 1029 groups and 16830
+items), 9 statements, policies and sampling seeds, 10 statement checks and C_W are all equal.
+
+**A trace of the host verifier, for the rest.** `tests/gpu-trace.py` runs on a machine with an
+NVIDIA GPU: `prove OUT --model tiny|qwen3|moe` proves a tiny model and saves the proof, the
+verifier's setup and the statement inputs; `trace OUT` (CPU only, no GPU needed) reruns
+`llm.verify(..., cpu=True)` and writes `trace.jsonl` with every sub-protocol call (domains,
+LogUp-GKR, sumchecks, the commitment's calls) with its inputs, outputs and transcript position,
+and which protocol step moved the transcript. That trace is what the step bodies will be ported
+and checked against. The script has not been run yet: this environment has no GPU.
+
 Not ported yet:
 
-- **The transformer protocol (`llm.verify`):** its statement, policy, weight commitment, the
-  F_O model's domains of each layer and how they feed the commitment. The pieces it is built from
-  are ported: the sumcheck, LogUp-GKR, domains and the commitment. `read-proof-file` parses a real proof, but a real proof
-  cannot be verified yet. Producing one needs the GPU prover, so end-to-end checks need a machine
-  with an NVIDIA GPU.
+- **The per-layer steps of `llm.verify` (`Proto.run`):** the F_O model's domains of each unit,
+  their claims and how they reach the commitment. Everything they are built from is ported: the
+  sumcheck, LogUp-GKR, domains, the commitment and the outer layer. `read-proof-file` parses a
+  real proof, but a real proof cannot be verified yet.
 - **The GPU prover:** the kernels generated for NVRTC, CuPy and PyTorch. It is not a candidate for
   a direct port.
 
@@ -273,8 +298,8 @@ make core       # sable.core, for `sbcl --core sable.core' (starts in SABLE-USER
 make test       # compile and run the tests (asdf:test-system "sable")
 make vectors    # regenerate tests/vectors.sexp from the Python code (numpy, blake3, g++)
 make crosscheck # check Lisp proofs with the original verifiers: GKR with vcore.cpp (numpy, g++);
-                #   domains and the commitment with zk/domain.py and zk/gpcs.py
-                #   (also PyTorch: make crosscheck PYTHON=...)
+                #   domains, the commitment and the statement with zk/domain.py, zk/gpcs.py
+                #   and zk/llm.py (also PyTorch: make crosscheck PYTHON=...)
 ```
 
 ## Use

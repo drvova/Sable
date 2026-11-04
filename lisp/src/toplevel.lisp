@@ -19,7 +19,7 @@
 
 (defpackage #:sable-user
   (:use #:cl #:sable.util #:sable.conditions #:sable.field #:sable.blake3 #:sable.transcript
-        #:sable.proofio #:sable.forms #:sable.rs #:sable.sumcheck #:sable.gkr #:sable.domain #:sable.pcs)
+        #:sable.proofio #:sable.forms #:sable.rs #:sable.sumcheck #:sable.gkr #:sable.domain #:sable.pcs #:sable.llm)
   (:import-from #:sable.toplevel #:help #:*version*)
   (:documentation "The package in which the executable reads and evaluates forms."))
 
@@ -29,7 +29,7 @@
 
 (defparameter *api-packages*
   '(#:sable.field #:sable.forms #:sable.blake3 #:sable.transcript #:sable.proofio #:sable.rs
-    #:sable.sumcheck #:sable.gkr #:sable.domain #:sable.pcs #:sable.conditions #:sable.util)
+    #:sable.sumcheck #:sable.gkr #:sable.domain #:sable.pcs #:sable.llm #:sable.conditions #:sable.util)
   "The packages whose exported functions make up the API, as HELP lists them.")
 
 ;;; ------------------------------------------------------------------ help
