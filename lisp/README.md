@@ -49,6 +49,18 @@ prover, the verifier and the final check:
                statement finals :constants ...))
 ```
 
+A table is a vector of 2^n base elements (integers) or extension elements. The prover stores
+tables flat. A base table stays in the base field until its first fold, which then costs D base
+products per entry instead of a full extension product. Each round computes the line values
+at X = 0, 2, 3, ... from the previous one with a single addition, into buffers allocated once per
+round. Against the earlier prover (best of 7 runs, F_p^8):
+
+| Prover run | Before | Now |
+|---|---|---|
+| 3 extension tables, 14 variables | 0.040 s, 50.6 MB allocated | 0.028 s, 10.1 MB |
+| 2 extension tables, 16 variables | 0.092 s, 106 MB | 0.072 s, 23.2 MB |
+| 2 base tables, 16 variables | not supported | 0.060 s, 19.5 MB |
+
 The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
 on symbolic coordinates:
 
@@ -84,7 +96,7 @@ On this machine (SBCL 2.2.9, a noisy virtual machine):
 | `transcript.lisp` | `zk/transcript.py` | the Fiat-Shamir transcript |
 | `proofio.lisp` | `zk/proofio.py` | the proof byte format (`SABLEPF1`) |
 | `rs.lisp` | `zk/rs.py` | the rate-1/2 Reed-Solomon code |
-| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, reference CPU prover |
+| `sumcheck.lisp` | `zk/sumcheck.py`, `zk/cuda/vcore.cpp` | the sumcheck of any statement form: verifier, final check, and a reference CPU prover on flat tables, with base tables kept in the base field until their first fold |
 | `toplevel.lisp` | | the executable: evaluates forms in `sable-user`; `(help)` |
 
 Python's `Poly` gives layer parameters negative column ids. With symbols as variables that
@@ -114,7 +126,7 @@ make vectors    # regenerate tests/vectors.sexp from the Python code (numpy, bla
 ```bash
 sable '(describe-proof (read-proof-file "/data/proof_1x4096.proof"))'
 sable '(normalize (quote (* (+ c0 3) (- c1 c0))))'
-sable '(demo :statement (quote (* t0 t1 t2)) :variables 14)'
+sable '(demo :statement (quote (* t0 t1 t2)) :variables 14 :base t)'
 sable '(run-tests)'
 sable - < script.lisp        # forms from standard input
 sable                        # a REPL, on a terminal

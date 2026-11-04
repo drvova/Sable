@@ -33,28 +33,89 @@
   "The degree of STATEMENT in its tables: the degree of each round polynomial."
   (form-degree statement (table-variables statement constants)))
 
-(defun statement-function (statement tables constants d)
-  "STATEMENT compiled as a function of the tables' values, in the order of TABLES (an alist)."
-  (let ((f (compile-form statement (append (mapcar #'car tables) (mapcar #'car constants)) :degree d))
-        (constant-values (mapcar #'cdr constants)))
-    (lambda (&rest table-values)
-      (apply f (append table-values constant-values)))))
-
 (defun weights (eq from n d)
   "w over the variables FROM..N-1: eq(r_from.., x), or all ones without EQ."
   (if eq
       (eq-table (subseq (coerce eq 'vector) from n) d)
       (make-array (expt 2 (- n from)) :initial-element (ext-one d))))
 
+;;; ------------------------------------------------------------------ tables
+;;;
+;;; A table is stored flat: entry x is ENTRIES[stride x, stride (x + 1)), a base element (stride 1)
+;;; or the D coordinates of an extension element (stride D).  A table given as base elements stays
+;;; in the base field until its first fold, which then needs only base-times-extension products.
+
+(defstruct (table (:constructor %make-table (stride entries)))
+  (stride 1 :type (integer 1 16) :read-only t)
+  (entries nil :type ext :read-only t))
+
+(defun make-table (values d)
+  "A table of VALUES: a sequence of base elements (integers) or of extension elements of degree D."
+  (let ((values (coerce values 'vector)))
+    (if (every #'integerp values)
+        (%make-table 1 (coerce-ext values))
+        (let ((entries (make-ext (* d (length values)))))
+          (loop for v across values
+                for x from 0
+                do (replace entries (if (integerp v) (base->ext v d) v) :start1 (* d x)))
+          (%make-table d entries)))))
+
+(defun table-size (table)
+  (floor (length (table-entries table)) (table-stride table)))
+
+(defun table-entry (table x out)
+  "Entry X of TABLE as an extension element, written into OUT."
+  (declare (type ext out) (type (integer 0 #.(floor most-positive-fixnum 16)) x) (optimize speed))
+  (let* ((stride (table-stride table))
+         (entries (table-entries table))
+         (start (* stride x)))
+    (dotimes (c (length out) out)
+      (setf (aref out c) (if (< c stride) (aref entries (+ start c)) 0)))))
+
+(defun fold-flat-table (table r)
+  "TABLE with its lowest variable bound to R: each pair (lo, hi) becomes lo + r (hi - lo).  For a
+base table the slope hi - lo is a base element, and r (hi - lo) costs D base products."
+  (declare (type ext r) (optimize speed))
+  (let* ((d (length r))
+         (half (floor (table-size table) 2))
+         (entries (table-entries table))
+         (base (= (table-stride table) 1))
+         (folded (make-ext (* d half)))
+         (lo (make-ext d)) (hi (make-ext d)) (term (make-ext d)))
+    (dotimes (i half (%make-table d folded))
+      (if base
+          (let ((lo (aref entries (* 2 i))))
+            (ext-scale r (fsub (aref entries (1+ (* 2 i))) lo) term)
+            (setf (aref term 0) (fadd (aref term 0) lo)))
+          (progn
+            (table-entry table (* 2 i) lo)
+            (table-entry table (1+ (* 2 i)) hi)
+            (ext+ lo (ext* r (ext- hi lo term) term) term)))
+      (dotimes (c d)
+        (setf (aref folded (+ (* d i) c)) (aref term c))))))
+
+;;; ------------------------------------------------------------------ the statement
+
+(defun statement-function (statement tables constants d)
+  "STATEMENT compiled over F_p^D as a function of the tables' values and then the constants'."
+  (compile-form statement (append (mapcar #'car tables) (mapcar #'car constants)) :degree d))
+
 (defun hypercube-sum (statement n tables d &key eq constants)
-  "sum_x w(x) F(tables(x)): the claim of an honest prover.  TABLES: an alist (variable . vector of
-2^N EXTs)."
-  (let ((f (statement-function statement tables constants d)))
-    (reduce #'ext+
-            (loop for w across (weights eq 0 n d)
-                  for x from 0
-                  collect (ext* w (apply f (mapcar (lambda (table) (aref (cdr table) x)) tables))))
-            :initial-value (make-ext d))))
+  "sum_x w(x) F(tables(x)): the claim of an honest prover.  TABLES: an alist (variable . 2^N base
+elements or EXTs)."
+  (let* ((f (statement-function statement tables constants d))
+         (flat (loop for (nil . values) in tables collect (make-table values d)))
+         (buffers (loop repeat (length flat) collect (make-ext d)))
+         (arguments (append buffers (mapcar #'cdr constants)))
+         (sum (make-ext d))
+         (term (make-ext d)))
+    (loop for w across (weights eq 0 n d)
+          for x from 0
+          do (loop for table in flat
+                   for buffer in buffers
+                   do (table-entry table x buffer))
+             (ext+ sum (ext* w (apply f arguments) term) sum))
+    sum))
 
 ;;; ------------------------------------------------------------------ verifier
 
@@ -101,55 +162,71 @@ values at the round challenges."
 
 ;;; ------------------------------------------------------------------ prover
 
-(defun line-value (table i x)
-  "TABLE along its lowest variable at pair I, at X: lo + X (hi - lo)."
-  (let ((lo (aref table (* 2 i)))
-        (hi (aref table (1+ (* 2 i)))))
-    (ext+ lo (ext-scale (ext- hi lo) x))))
-
-(defun round-message (f tables weights points d)
+(defun round-message (f tables constant-values weights points d)
   "The round polynomial g(X) = sum_i w_i F(line values at X) at X = 0, 2, 3, ..., POINTS, as the
-rows of a field array."
-  (flet ((g (x)
-           (reduce #'ext+
-                   (loop for w across weights
-                         for i from 0
-                         collect (ext* w (apply f (mapcar (lambda (table) (line-value (cdr table) i x))
-                                                          tables))))
-                   :initial-value (make-ext d))))
+rows of a field array.  For each pair (lo, hi) of a table, the line values at X = 0, 1, 2, ... are
+lo, hi, hi + s, hi + 2s, ... for the slope s = hi - lo: additions only.  Every buffer is allocated
+once per round."
+  (let* ((xs (cons 0 (loop for x from 2 to points collect x)))
+         (lines (loop repeat (length tables)
+                      collect (coerce (loop repeat (1+ points) collect (make-ext d)) 'vector)))
+         (arguments (loop for x in xs
+                          collect (append (mapcar (lambda (line) (aref line x)) lines) constant-values)))
+         (sums (loop repeat (length xs) collect (make-ext d)))
+         (slope (make-ext d))
+         (term (make-ext d)))
+    (loop for w across weights
+          for i from 0
+          do (loop for table in tables
+                   for line in lines
+                   do (table-entry table (* 2 i) (aref line 0))
+                      (table-entry table (1+ (* 2 i)) (aref line 1))
+                      (ext- (aref line 1) (aref line 0) slope)
+                      (loop for x from 2 to points
+                            do (ext+ (aref line (1- x)) slope (aref line x))))
+             (loop for args in arguments
+                   for sum in sums
+                   do (ext+ sum (ext* w (apply f args) term) sum)))
     (make-array (list points d)
                 :element-type '(unsigned-byte 32)
-                :initial-contents (loop for x in (cons 0 (loop for x from 2 to points collect x))
-                                        collect (coerce (g x) 'list)))))
+                :initial-contents (mapcar (lambda (sum) (coerce sum 'list)) sums))))
 
 (defun prove (tr n statement tables &key eq constants (label "sc"))
   "Prove the sumcheck of STATEMENT on the prover transcript TR (a reference prover, on the CPU).
-TABLES: an alist (variable . vector of 2^N EXTs).  Returns the round challenges and the finals, an
-alist (variable . value at the challenges) for CHECK-FINAL."
+TABLES: an alist (variable . 2^N base elements or EXTs); base tables stay in the base field until
+the first fold.  Returns the round challenges and the finals, an alist (variable . EXT at the
+challenges) for CHECK-FINAL."
   (let* ((d (transcript-degree tr))
          (degree (statement-degree statement constants))
-         (tables (loop for (variable . table) in tables collect (cons variable (coerce table 'vector))))
-         (f (statement-function statement tables constants d)))
+         (f (statement-function statement tables constants d))
+         (constant-values (mapcar #'cdr constants))
+         (names (mapcar #'car tables))
+         (flat (loop for (nil . values) in tables collect (make-table values d))))
     (absorb tr (header label n degree))
     (values (loop for j below n
                   collect (progn
-                            (send tr (round-message f tables (weights eq (1+ j) n d) (max degree 1) d))
+                            (send tr (round-message f flat constant-values (weights eq (1+ j) n d)
+                                                    (max degree 1) d))
                             (let ((r (challenge tr)))
-                              (setf tables (loop for (variable . table) in tables
-                                                 collect (cons variable (fold-table table r))))
+                              (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
                               r)))
-            (loop for (variable . table) in tables collect (cons variable (aref table 0))))))
+            (loop for name in names
+                  for table in flat
+                  collect (cons name (table-entry table 0 (make-ext d)))))))
 
 ;;; ------------------------------------------------------------------ demonstration
 
-(defun demo (&key (statement '(* t0 t1 t2)) (variables 10) (degree 8) (seed 1))
+(defun demo (&key (statement '(* t0 t1 t2)) (variables 10) (degree 8) base (seed 1))
   "Prove and verify the sumcheck of STATEMENT (in eq mode) on random tables of VARIABLES variables
-over F_p^DEGREE, then check that a tampered proof is rejected.  Returns the proof's size in bytes."
+over F_p^DEGREE, then check that a tampered proof is rejected.  With BASE, the tables hold base
+elements, as Sable's do.  Returns the proof's size in bytes."
   (let* ((state (sb-ext:seed-random-state seed))
          (random-ext (lambda () (coerce-ext (loop repeat degree collect (random +p+ state)))))
          (tables (loop for variable in (form-variables statement)
                        collect (cons variable (coerce (loop repeat (expt 2 variables)
-                                                            collect (funcall random-ext))
+                                                            collect (if base
+                                                                        (random +p+ state)
+                                                                        (funcall random-ext)))
                                                       'vector))))
          (eq (loop repeat variables collect (funcall random-ext)))
          (claim (hypercube-sum statement variables tables degree :eq eq))
@@ -165,7 +242,8 @@ over F_p^DEGREE, then check that a tampered proof is rejected.  Returns the proo
                (unless (transcript-finished-p verifier)
                  (reject :unread-messages)))))
       (verify-messages (sable.proofio:decode-proof proof))
-      (format t "~&sumcheck of ~S over ~D variables in F_p^~D, eq mode~%" statement variables degree)
+      (format t "~&sumcheck of ~S over ~D variables in F_p^~D, eq mode, ~:[extension~;base~] tables~%"
+              statement variables degree base)
       (format t "proved in ~,3F s (~:D-byte proof), verified in ~,3F s~%"
               (/ (- proved start) internal-time-units-per-second) (length proof)
               (/ (- (get-internal-real-time) proved) internal-time-units-per-second))

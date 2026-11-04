@@ -315,3 +315,22 @@
     (assert (sable.sumcheck:check-final
              (nth-value 1 (sable.sumcheck:verify verifier n statement claim :constants constants))
              statement finals :constants constants))))
+
+(defun test-sumcheck-base-tables ()
+  ;; base tables are the same polynomial as their lift to F_p^D: the same proof, byte for byte
+  (dolist (d '(4 8))
+    (let* ((n 4)
+           (statement '(+ (* t0 t1 t2) (* 7 t1)))
+           (state (sb-ext:seed-random-state d))
+           (base (loop for v in '(t0 t1 t2)
+                       collect (cons v (coerce (loop repeat (expt 2 n) collect (random +p+ state)) 'vector))))
+           (lifted (loop for (v . values) in base
+                         collect (cons v (map 'vector (lambda (x) (base->ext x d)) values))))
+           (eq (loop repeat n collect (coerce-ext (loop repeat d collect (random +p+ state))))))
+      (flet ((proof (tables)
+               (let ((tr (make-transcript "base" d)))
+                 (multiple-value-bind (rho finals) (sable.sumcheck:prove tr n statement tables :eq eq)
+                   (list (lists rho) finals (sable.proofio:encode-proof (transcript-messages tr)))))))
+        (assert (equalp (proof base) (proof lifted)))
+        (assert (ext= (sable.sumcheck:hypercube-sum statement n base d :eq eq)
+                      (sable.sumcheck:hypercube-sum statement n lifted d :eq eq)))))))
