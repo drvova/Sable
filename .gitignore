@@ -1,8 +1,7 @@
-__pycache__/
-*.pyc
-build/
-*.log
-.venv/
+# the built executable and image
+/exacta
+/exacta.core
+*.fasl
 # LaTeX build artifacts (paper/)
 *.aux
 *.bbl
@@ -14,8 +13,3 @@ build/
 *.nav
 *.snm
 *.xdv
-*.egg-info/
-dist/
-.pytest_cache/
-.ruff_cache/
-results/
