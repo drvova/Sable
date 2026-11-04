@@ -66,18 +66,27 @@ form you can read:
   constants, the statement runs in base-field arithmetic and each term costs one base-times-extension
   product by its eq weight.
 
+The eq weights of the remaining variables are split in two (`split-weights`, after Dao and Thaler,
+ePrint 2024/1210). The weight of pair x = h·|low| + l is low[l]·high[h], each table over half of
+the variables. So a round builds two tables of about √N entries instead of one of N/2. The kernel
+sums the inner loop over l with the low weights, and multiplies each block by its high weight once
+per point.
+
 Compiling a kernel takes 8–20 ms, once per statement. A statement whose kernel would exceed
 `*kernel-size-limit*` uses the generic loop instead, and a test checks that both give the same
 proofs.
 
 Best of 7 runs, F_p^8:
 
-| Prover run | Field rewrite (steps 1–2) | Flat tables (step 3) | Round kernels (step 4) |
-|---|---|---|---|
-| 3 extension tables, 14 variables | 0.040 s, 50.6 MB allocated | 0.028 s, 10.1 MB | 0.024 s, 5.4 MB |
-| 3 base tables, 14 variables | not supported | 0.028 s, 8.7 MB | 0.016 s, 4.0 MB |
-| 2 extension tables, 16 variables | 0.092 s, 106 MB | 0.072 s, 23.2 MB | 0.064–0.068 s, 16.9 MB |
-| 2 base tables, 16 variables | not supported | 0.060 s, 19.5 MB | 0.044–0.048 s, 13.2 MB |
+| Prover run | Field rewrite (steps 1–2) | Flat tables (step 3) | Round kernels (step 4) | Split eq (step 5) |
+|---|---|---|---|---|
+| 3 extension tables, 14 variables | 0.040 s, 50.6 MB allocated | 0.028 s, 10.1 MB | 0.024 s, 5.4 MB | 0.024 s, 3.4 MB |
+| 3 base tables, 14 variables | not supported | 0.028 s, 8.7 MB | 0.016 s, 4.0 MB | 0.012 s, 2.0 MB |
+| 2 extension tables, 16 variables | 0.092 s, 106 MB | 0.072 s, 23.2 MB | 0.064–0.068 s, 16.9 MB | 0.052–0.056 s, 8.7 MB |
+| 2 base tables, 16 variables | not supported | 0.060 s, 19.5 MB | 0.044–0.048 s, 13.2 MB | 0.036 s, 5.0 MB |
+
+These runs are close to the timer's 4 ms resolution. On 18 variables (best of 3), the split eq
+takes 3 extension tables from 0.452 s to 0.424 s, and 3 base tables from 0.292 s to 0.244 s.
 
 The field tower works the same way. `mul*` and `inv*` define multiplication and inversion once,
 on symbolic coordinates:

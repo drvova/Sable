@@ -39,6 +39,14 @@
       (eq-table (subseq (coerce eq 'vector) from n) d)
       (make-array (expt 2 (- n from)) :initial-element (ext-one d))))
 
+(defun split-weights (eq from n d)
+  "WEIGHTS over the variables FROM..N-1 as two tables, LOW over the lower half of them and HIGH over
+the upper half, so that the weight of x = h 2^|low| + l is LOW[l] HIGH[h] (Dao and Thaler, ePrint
+2024/1210): two tables of about the square root of the size of one."
+  (let ((middle (+ from (floor (- n from) 2))))
+    (values (weights eq from middle d)
+            (weights eq middle n d))))
+
 ;;; ------------------------------------------------------------------ tables
 ;;;
 ;;; A table is stored flat: entry x is ENTRIES[stride x, stride (x + 1)), a base element (stride 1)
@@ -162,12 +170,15 @@ values at the round challenges."
 
 ;;; ------------------------------------------------------------------ prover
 
-;;; One round of the prover computes g(X) = sum_i w_i F(line values at X) at X = 0, 2, 3, ...,
-;;; points.  For each pair (lo, hi) of a table, the line values at X = 0, 1, 2, ... are lo, hi,
-;;; hi + s, hi + 2s, ... for the slope s = hi - lo: additions only.  ROUND-KERNEL-CODE writes the
-;;; whole round for one statement as a LAMBDA form, with the statement inlined and the tables and
-;;; points unrolled, every buffer made once per round; GENERIC-ROUND-SUMS is the same loop
-;;; calling the compiled statement, for statements whose kernel would be too large.
+;;; One round of the prover computes g(X) = sum_x w(x) F(line values at X) at X = 0, 2, 3, ...,
+;;; points, over the pairs x of the tables.  For each pair (lo, hi) of a table, the line values at
+;;; X = 0, 1, 2, ... are lo, hi, hi + s, hi + 2s, ... for the slope s = hi - lo: additions only.
+;;; The weight w(x) = LOW[l] HIGH[h] for x = h |LOW| + l (SPLIT-WEIGHTS): the inner loop sums over l
+;;; with the LOW weights, and each block is multiplied by its HIGH weight once per point.
+;;; ROUND-KERNEL-CODE writes the whole round for one statement as a LAMBDA form, with the statement
+;;; inlined and the tables and points unrolled, every buffer made once per round;
+;;; GENERIC-ROUND-SUMS is the same loop calling the compiled statement, for statements whose
+;;; kernel would be too large.
 
 (defun evaluation-points (points)
   "X = 0, 2, 3, ..., POINTS: g(1) follows from the claim."
@@ -175,19 +186,21 @@ values at the round challenges."
 
 (defun round-kernel-code (statement table-names constant-names d points base)
   "The LAMBDA form of one prover round for STATEMENT: a function of the tables (TABLEs, in the
-order of TABLE-NAMES), the eq weights (a vector of EXTs) and the constants' values (in the order
-of CONSTANT-NAMES), returning g's sums at the EVALUATION-POINTS.  With BASE (all tables in the
-base field, no constants), the line values and the statement are base-field integers, and each
-term costs one base-times-extension product by its weight."
+order of TABLE-NAMES), the LOW and HIGH eq weights (vectors of EXTs, SPLIT-WEIGHTS) and the
+constants' values (in the order of CONSTANT-NAMES), returning g's sums at the EVALUATION-POINTS.
+With BASE (all tables in the base field, no constants), the line values and the statement are
+base-field integers, and each term costs one base-times-extension product by its weight."
   (let* ((xs (evaluation-points points))
          (n-tables (length table-names))
-         (tables (gensym "TABLES")) (weights (gensym "WEIGHTS")) (i (gensym "I")) (w (gensym "W"))
+         (tables (gensym "TABLES")) (low (gensym "LOW")) (high (gensym "HIGH"))
+         (h (gensym "H")) (l (gensym "L")) (i (gensym "I")) (w (gensym "W"))
          (slope (gensym "SLOPE")) (term (gensym "TERM"))
          (table-vars (loop repeat n-tables collect (gensym "TABLE")))
          (entries (loop repeat n-tables collect (gensym "ENTRIES")))
          (slopes (loop repeat n-tables collect (gensym "SLOPE")))
          ;; the line values of each table at X = 0 .. points
          (lines (loop repeat n-tables collect (loop repeat (1+ points) collect (gensym "LINE"))))
+         (inners (loop repeat (length xs) collect (gensym "INNER")))
          (sums (loop repeat (length xs) collect (gensym "SUM"))))
     (multiple-value-bind (buffers code)
         (if base (values '() (arithmetic-form statement)) (in-place-code statement d))
@@ -195,40 +208,48 @@ term costs one base-times-extension product by its weight."
                "STATEMENT's code with each table variable bound to its line value at X."
                `(let ,(loop for name in table-names for line in lines collect `(,name ,(nth x line)))
                   ,code)))
-        `(lambda (,tables ,weights ,@constant-names)
-           (declare (type list ,tables) (type simple-vector ,weights) (optimize speed)
+        `(lambda (,tables ,low ,high ,@constant-names)
+           (declare (type list ,tables) (type simple-vector ,low ,high) (optimize speed)
                     (sb-ext:muffle-conditions sb-ext:compiler-note))
            (destructuring-bind ,table-vars ,tables
              (let* (,@(loop for table in table-vars for e in entries
                             collect `(,e (table-entries ,table)))
                     ,@(unless base
                         (loop for line in lines append (loop for v in line collect `(,v (make-ext ,d)))))
+                    ,@(loop for inner in inners collect `(,inner (make-ext ,d)))
                     ,@(loop for sum in sums collect `(,sum (make-ext ,d)))
                     (,slope (make-ext ,d))
                     (,term (make-ext ,d))
                     ,@buffers)
                (declare (type ext ,@entries) (ignorable ,@entries ,slope))
-               (dotimes (,i (length ,weights))
-                 (let ((,w (svref ,weights ,i)))
-                   ,(if base
-                        `(let* ,(loop for line in lines for e in entries for s in slopes
-                                      append `((,(first line) (aref ,e (* 2 ,i)))
-                                               (,(second line) (aref ,e (1+ (* 2 ,i))))
-                                               (,s (fsub ,(second line) ,(first line)))
-                                               ,@(loop for (previous next) on (rest line)
-                                                       while next collect `(,next (fadd ,previous ,s)))))
-                           (declare (type fp ,@(loop for line in lines append line) ,@slopes) (ignorable ,@slopes))
-                           ,@(loop for x in xs for sum in sums
-                                   collect `(ext+ ,sum (ext-scale ,w ,(at x) ,term) ,sum)))
-                        `(progn
-                           ,@(loop for line in lines for table in table-vars
-                                   append `((table-entry ,table (* 2 ,i) ,(first line))
-                                            (table-entry ,table (1+ (* 2 ,i)) ,(second line))
-                                            (ext- ,(second line) ,(first line) ,slope)
-                                            ,@(loop for (previous next) on (rest line)
-                                                    while next collect `(ext+ ,previous ,slope ,next))))
-                           ,@(loop for x in xs for sum in sums
-                                   collect `(ext+ ,sum (ext* ,w ,(at x) ,term) ,sum))))))
+               (dotimes (,h (length ,high))
+                 ,@(loop for inner in inners collect `(fill ,inner 0))
+                 (dotimes (,l (length ,low))
+                   (let ((,i (+ (* ,h (length ,low)) ,l))
+                         (,w (svref ,low ,l)))
+                     (declare (type fixnum ,i))
+                     ,(if base
+                          `(let* ,(loop for line in lines for e in entries for s in slopes
+                                        append `((,(first line) (aref ,e (* 2 ,i)))
+                                                 (,(second line) (aref ,e (1+ (* 2 ,i))))
+                                                 (,s (fsub ,(second line) ,(first line)))
+                                                 ,@(loop for (previous next) on (rest line)
+                                                         while next collect `(,next (fadd ,previous ,s)))))
+                             (declare (type fp ,@(loop for line in lines append line) ,@slopes)
+                                      (ignorable ,@slopes))
+                             ,@(loop for x in xs for inner in inners
+                                     collect `(ext+ ,inner (ext-scale ,w ,(at x) ,term) ,inner)))
+                          `(progn
+                             ,@(loop for line in lines for table in table-vars
+                                     append `((table-entry ,table (* 2 ,i) ,(first line))
+                                              (table-entry ,table (1+ (* 2 ,i)) ,(second line))
+                                              (ext- ,(second line) ,(first line) ,slope)
+                                              ,@(loop for (previous next) on (rest line)
+                                                      while next collect `(ext+ ,previous ,slope ,next))))
+                             ,@(loop for x in xs for inner in inners
+                                     collect `(ext+ ,inner (ext* ,w ,(at x) ,term) ,inner))))))
+                 ,@(loop for inner in inners for sum in sums
+                         collect `(ext+ ,sum (ext* (svref ,high ,h) ,inner ,term) ,sum)))
                (list ,@sums))))))))
 
 (defparameter *kernel-size-limit* 20000
@@ -253,28 +274,35 @@ uses GENERIC-ROUND-SUMS (compiling a huge straight-line function takes longer th
                   (and (<= (code-size code) *kernel-size-limit*)
                        (compile nil code))))))))
 
-(defun generic-round-sums (f tables constant-values weights points d)
+(defun generic-round-sums (f tables constant-values low high points d)
   "g's sums at the EVALUATION-POINTS, calling the compiled statement F for each pair and point."
   (let* ((xs (evaluation-points points))
          (lines (loop repeat (length tables)
                       collect (coerce (loop repeat (1+ points) collect (make-ext d)) 'vector)))
          (arguments (loop for x in xs
                           collect (append (mapcar (lambda (line) (aref line x)) lines) constant-values)))
+         (inners (loop repeat (length xs) collect (make-ext d)))
          (sums (loop repeat (length xs) collect (make-ext d)))
          (slope (make-ext d))
          (term (make-ext d)))
-    (loop for w across weights
-          for i from 0
-          do (loop for table in tables
-                   for line in lines
-                   do (table-entry table (* 2 i) (aref line 0))
-                      (table-entry table (1+ (* 2 i)) (aref line 1))
-                      (ext- (aref line 1) (aref line 0) slope)
-                      (loop for x from 2 to points
-                            do (ext+ (aref line (1- x)) slope (aref line x))))
-             (loop for args in arguments
+    (loop for wh across high
+          for h from 0
+          do (dolist (inner inners) (fill inner 0))
+             (loop for w across low
+                   for i from (* h (length low))
+                   do (loop for table in tables
+                            for line in lines
+                            do (table-entry table (* 2 i) (aref line 0))
+                               (table-entry table (1+ (* 2 i)) (aref line 1))
+                               (ext- (aref line 1) (aref line 0) slope)
+                               (loop for x from 2 to points
+                                     do (ext+ (aref line (1- x)) slope (aref line x))))
+                      (loop for args in arguments
+                            for inner in inners
+                            do (ext+ inner (ext* w (apply f args) term) inner)))
+             (loop for inner in inners
                    for sum in sums
-                   do (ext+ sum (ext* w (apply f args) term) sum)))
+                   do (ext+ sum (ext* wh inner term) sum)))
     sums))
 
 (defun round-message (sums points d)
@@ -286,7 +314,8 @@ uses GENERIC-ROUND-SUMS (compiling a huge straight-line function takes longer th
 (defun prove (tr n statement tables &key eq constants (label "sc"))
   "Prove the sumcheck of STATEMENT on the prover transcript TR (a reference prover, on the CPU).
 TABLES: an alist (variable . 2^N base elements or EXTs); base tables stay in the base field until
-the first fold.  Each round runs the statement's compiled ROUND-KERNEL.  Returns the round
+the first fold.  Each round runs the statement's compiled ROUND-KERNEL, with the eq weights split
+in two (SPLIT-WEIGHTS).  Returns the round
 challenges and the finals, an alist (variable . EXT at the challenges) for CHECK-FINAL."
   (let* ((d (transcript-degree tr))
          (points (max (statement-degree statement constants) 1))
@@ -296,19 +325,19 @@ challenges and the finals, an alist (variable . EXT at the challenges) for CHECK
          (flat (loop for (nil . values) in tables collect (make-table values d))))
     (absorb tr (header label n (statement-degree statement constants)))
     (values (loop for j below n
-                  collect (let* ((weights (weights eq (1+ j) n d))
-                                 (base (and (null constants)
-                                            (every (lambda (table) (= (table-stride table) 1)) flat)))
-                                 (kernel (round-kernel statement names constant-names d points base))
-                                 (sums (if kernel
-                                           (apply kernel flat weights constant-values)
-                                           (generic-round-sums
-                                            (statement-function statement tables constants d)
-                                            flat constant-values weights points d))))
-                            (send tr (round-message sums points d))
-                            (let ((r (challenge tr)))
-                              (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
-                              r)))
+                  collect (multiple-value-bind (low high) (split-weights eq (1+ j) n d)
+                            (let* ((base (and (null constants)
+                                              (every (lambda (table) (= (table-stride table) 1)) flat)))
+                                   (kernel (round-kernel statement names constant-names d points base))
+                                   (sums (if kernel
+                                             (apply kernel flat low high constant-values)
+                                             (generic-round-sums
+                                              (statement-function statement tables constants d)
+                                              flat constant-values low high points d))))
+                              (send tr (round-message sums points d))
+                              (let ((r (challenge tr)))
+                                (setf flat (mapcar (lambda (table) (fold-flat-table table r)) flat))
+                                r))))
             (loop for name in names
                   for table in flat
                   collect (cons name (table-entry table 0 (make-ext d)))))))
