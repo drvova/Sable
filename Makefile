@@ -17,7 +17,7 @@ exacta.core: $(SRC)
 core: exacta.core
 
 test:
-	$(SBCL) --non-interactive --eval '(require "asdf")' --eval '(asdf:load-asd (truename "exacta.asd"))' \
+	$(SBCL) --dynamic-space-size $(HEAP) --non-interactive --eval '(require "asdf")' --eval '(asdf:load-asd (truename "exacta.asd"))' \
 	  --eval '(asdf:test-system "exacta")'
 
 clean:

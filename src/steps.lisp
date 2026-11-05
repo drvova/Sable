@@ -18,7 +18,7 @@
            #:db #:make-db #:db-column #:db-zero #:db-lookup #:db-run
            #:route-block #:route-virtual #:route-public
            #:rq-rows #:ns-rows #:sr-rows #:cap-col #:combine-blocks
-           #:layer-parameters #:layer-head #:step-mo #:step-mlp #:step-state #:matmul #:oh-check))
+           #:layer-parameters #:layer-head #:step-mo #:step-mlp #:step-mi #:step-state #:matmul #:oh-check #:gather-rowsum #:rq-norm-dom))
 
 (in-package #:exacta.steps)
 
@@ -677,3 +677,94 @@ and up products, and the opening of G_mlp<s>."
                                 (when (and (>= blk c0) (< blk c1))
                                   (setf acc (ext+ acc (ext-scale (aref e m) (field (aref x m (aref j m)))))))))))
             'vector)))
+
+;;; ------------------------------------------------------------------ the MLP input
+
+(defun flush-oh (context state shape l witness)
+  "The row checks of the slices' one-hot claims of layer L (Proto.flush_oh), one per kind."
+  (let ((pending (step-state-oh-pending state))
+        (prefix (format nil "~D." l)))
+    (dolist (jbn (remove-duplicates (mapcar #'first pending) :test #'string= :from-end t))
+      (let ((mine (loop for (name rho full) in pending
+                        when (and (string= name jbn) (eql 0 (search prefix name))) collect (list rho full))))
+        (when mine
+          (let ((key (if (search ".ru." jbn) :ru :rm)))
+            (oh-check context "mlp-oh" jbn (shape-cb shape) (nbits (shape-kf shape)) mine (shape-t* shape)
+                      (lambda () (getf (getf witness key) :jb))))
+          (setf pending (remove-if (lambda (entry) (and (string= (first entry) jbn) (eql 0 (search prefix jbn))))
+                                   pending)))))
+    (setf (step-state-oh-pending state) pending)))
+
+(defun rq-norm-dom (context db h qn qpn rpre npre r n cb)
+  "Requant8 + NormScale lookups over a row-major domain of the rows' elements (Proto.rq_norm_dom)."
+  (flet ((rowc (name data) (db-column db name data (route-block context name) :kind :row :c cb :shared t)))
+    (let* ((q (db-column db qn (lambda () (rm-layout (getf r :q) cb)) (route-block context qn)))
+           (qp (db-column db qpn (lambda () (rm-layout (getf n :qp) cb)) (route-block context qpn)))
+           (e (rowc (s+ rpre "e") (lambda () (getf r :e))))
+           (s (rowc (s+ rpre "s") (lambda () (getf r :s))))
+           (mu (rowc (s+ npre "mu") (lambda () (getf n :mu)))))
+      (db-lookup db `(+ ,e 1) (list `(+ (- (* 2 ,h) (* 2 ,s ,q)) ,s)))
+      (db-lookup db exacta.tables:+star8+ (list `(+ ,q 127)))
+      (db-lookup db 15 (list `(- (+ (* ,q ,mu) ,(expt 2 14)) (* ,(expt 2 15) ,qp))))
+      (db-lookup db exacta.tables:+star8+ (list `(+ ,qp 127)))
+      (values q qp))))
+
+(defun gather-rowsum (context label n-rows rowpt k cols h q asel sig jb-name bits cb)
+  "The gather and row-sum sumcheck over a row-major (rows x K 2^cb) domain (Proto.gather_rowsum):
+sum_{m,x} eq(r, m) [OH(m, x) h(m, x) + gamma q(m, x)^2] = asel(r) + gamma (sig(r) - 1).  COLS:
+(name data route) per column, H a function of their symbols giving the gathered form, Q the index
+of the squared column or NIL; BITS a function giving the j* bit planes."
+  (let* ((n (+ cb n-rows))
+         (gam (context-challenge context))
+         (prover (prover-p context))
+         (claim (if prover
+                    (make-ext 4)
+                    (if sig (ext+ asel (ext* gam (ext- sig (ext-one 4)))) asel)))
+         (symbols (loop for i below (length cols) collect (intern (format nil "G~D" i) '#:exacta.steps)))
+         (gathered (piece `(* oh ,(funcall h symbols))))
+         (statement (if q
+                        `(* ,(piece 'eqr) (+ ,gathered (* c0 ,(piece `(* ,(nth q symbols) ,(nth q symbols))))))
+                        `(* ,(piece 'eqr) ,gathered)))
+         (tables (append (list (list 'eqr :row cb t (and prover (eq-table rowpt 4)))
+                               (list 'oh :full 0 nil (and prover (gather-one-hot (jstar (funcall bits)) k n-rows cb))))
+                         (loop for (nil data) in cols for g in symbols
+                               collect (list g :full 0 nil (and prover (row-field (funcall data))))))))
+    (multiple-value-bind (rho finals)
+        (run-sumcheck context label n k statement claim tables :constants (and q `((c0 . ,gam))))
+      (check-eq context label (first finals) rowpt (nthcdr cb rho))
+      (loop for (nil nil route) in cols for f in (nthcdr 2 finals)
+            do (funcall route rho f))
+      (oh-check context label jb-name cb (nbits k) (list (list rho (second finals))) n-rows bits))))
+
+(defun gather-one-hot (j k n-rows cb)
+  "1 at each row's j*, in rm layout (K blocks of 2^n-rows rows of 2^cb)."
+  (let ((out (make-array (* k (expt 2 (+ n-rows cb))) :initial-element 0)))
+    (dotimes (m (expt 2 n-rows) out)
+      (setf (aref out (+ (ash (+ (ash (ash (aref j m) (- cb)) n-rows) m) cb) (ldb (byte cb 0) (aref j m)))) 1))))
+
+(defun step-mi (context model shape l state witness)
+  "The MLP input (Proto.step_mi): the slices' one-hot row checks; the Requant8 + NormScale of the
+residual h_mid (the attention's SatAdd output) over the layer's elements; the gather and row-sum
+sumcheck of its minimality and squared sum; the opening of G_mi."
+  (declare (ignore model))
+  (let* ((cb (shape-cb shape)) (tt (shape-t* shape)) (kd (shape-kd shape))
+         (p (format nil "~D." l))
+         (w witness))
+    (flush-oh context state shape l witness)
+    (let ((db (make-db context (s+ p "mi") (+ cb tt) :k kd)))
+      (let* ((s1 (db-column db (s+ p "s1") (lambda () (rm-layout (getf w :s1) cb)) (route-block context (s+ p "s1"))))
+             (o1 (db-column db (s+ p "os1") (lambda () (rm-layout (getf w :os1) cb)) (route-block context (s+ p "os1")))))
+        (rq-norm-dom context db (hexpr s1 o1) (s+ p "q2") (s+ p "qp2") (s+ p "r2.") (s+ p "n2.") (getf w :r2) (getf w :n2) cb))
+      (db-run db))
+    (when (active-p context)
+      (destructuring-bind ((pa va)) (take-virtual context (list l "asel2"))
+        (destructuring-bind ((ps vs)) (take-virtual context (list l "sig2"))
+          (declare (ignore ps))
+          (gather-rowsum context "mi-g" tt pa kd
+                         (list (list (s+ p "s1") (lambda () (rm-layout (getf w :s1) cb)) (route-block context (s+ p "s1")))
+                               (list (s+ p "os1") (lambda () (rm-layout (getf w :os1) cb)) (route-block context (s+ p "os1")))
+                               (list (s+ p "q2") (lambda () (rm-layout (getf (getf w :r2) :q) cb)) (route-block context (s+ p "q2"))))
+                         (lambda (c) (hexpr (first c) (second c))) 2 (aref va 0) (aref vs 0)
+                         (s+ p "r2.jb") (lambda () (getf (getf w :r2) :jb)) cb)))
+      (open-group context (s+ p "mi")))
+    state))

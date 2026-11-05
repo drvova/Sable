@@ -906,8 +906,7 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
     (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
     (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce")
     (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c")
-    (export-step-mo-cases "00348957a008539af802f9075518564012739cdf1a4e5376ae4880a549cd6710")
-    (export-step-mlp-cases "f48dec4c0b3829d8d1d16a43ccccba42afd4d1ad91920fe7ee8ae6014061e338"))
+    (export-step-mi-cases "04a96b486434957a2442ed7188768fae281c669095290b1c57728dcd42b8ed6e"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
@@ -917,7 +916,9 @@ same values and rejected its 95 forgeries; Sable's logup.table_side, at 2^9 rows
 table-side scenario with the same claims and chunk sums and rejected its 172 forgeries; Sable's
 Proto.step_mo replayed the tiny model's layer-0 MLP output step, left the same claims on 44 tensors,
 virtual claims and down-projection partials, and rejected all 1542 forgeries; with the MLP slice
-after it (step_mlp), the same claims on 48 tensors and one-hot claims, all 2211 forgeries rejected.  The files differ from those only in the proof magic
+after it (step_mlp), the same claims on 48 tensors and one-hot claims, all 2211 forgeries rejected;
+then the MLP input (step_mi), the same claims on 5 tensors, all 2749 forgeries rejected.  Only the
+cumulative step case is pinned: its proof holds the earlier steps' messages.  The files differ from those only in the proof magic
 (EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
@@ -1479,7 +1480,36 @@ TEST-FROZEN-CASES pins it."
              (let ((mlp (getf (getf w :forward) :mlp)))
                (list (cons "0.m0.c" (rm (getf mlp :c))) (cons "0.m0.a" (rm (getf mlp :a)))
                      (cons "0.m0.qu" (rm (getf (getf w :ru) :q))) (cons "0.m0.qm" (rm (getf (getf w :rm) :q))))))
+            ((string= group "0.mi") (mi-tensors w cb))
             (t (error "step-tensors: ~A" group))))))
+
+(defun mi-tensors (w cb)
+  "G_mi's tensors (Proto.tensors \"mi\"), dense layers."
+  (flet ((rm (m) (exacta.steps:rm-layout m cb))
+         (rows (v) (map 'vector (lambda (x) (mod x +p+)) v)))
+    (append (list (cons "0.q2" (rm (getf (getf w :r2) :q))) (cons "0.qp2" (rm (getf (getf w :n2) :qp))))
+            (loop for (pre key) in '(("r2." :r2) ("ru." :ru) ("rm." :rm))
+                  for r = (getf w key)
+                  append (loop for f in '("e" "s" "f" "sig" "wl" "wh")
+                               collect (cons (format nil "0.~A~A" pre f) (rows (getf r (intern (string-upcase f) :keyword)))))
+                  collect (cons (format nil "0.~Ajb" pre) (rows (apply #'concatenate 'vector (getf r :jb)))))
+            (loop for f in '("Eh" "Ep" "pEp" "pEn" "pEh" "delta" "rho" "mu" "ng")
+                  collect (cons (format nil "0.n2.~A" f) (rows (getf (getf w :n2) (intern (string-upcase f) :keyword)))))
+            (let ((sd (exacta.steps:sr-pack (getf w :kd))))
+              (loop for f in '("k" "s" "R" "tR" "tB" "oB" "tA" "oA" "f")
+                    collect (cons (format nil "0.sd.~A" f) (rows (getf sd (intern (string-upcase f) :keyword))))))
+            (loop for f in '("E" "pE" "f")
+                  collect (cons (format nil "0.g.~A" f) (rows (getf (getf w :eg) (intern (string-upcase f) :keyword))))))))
+
+(defun step-mo-mlp-mi (context model shape l state witness)
+  "step_mo, every MLP slice, step_mi."
+  (step-mo-mlp context model shape l state witness)
+  (exacta.steps:step-mi context model shape l state witness))
+
+(defun export-step-mi-cases (path)
+  "step_mo, the MLP slice and step_mi of the tiny model's layer 0.  Sable's Proto replayed exactly
+this; TEST-FROZEN-CASES pins it."
+  (export-step-case path #'step-mo-mlp-mi '("0.mo" "0.mlp0" "0.mi")))
 
 (defun step-mo-mlp (context model shape l state witness)
   "step_mo, then every MLP slice (Proto.layer_steps' order)."
