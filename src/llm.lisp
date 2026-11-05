@@ -11,7 +11,10 @@
   (:use #:cl #:exacta.util #:exacta.conditions #:exacta.sha256 #:exacta.proto)
   (:export #:cfg #:make-cfg #:cfg-repr #:cfg-l #:cfg-d #:cfg-nh #:cfg-nkv #:cfg-dh #:cfg-dff #:cfg-v
            #:cfg-theta #:cfg-qk-norm #:cfg-qkv-bias #:cfg-moe #:cfg-down-b #:shape #:make-shape #:column-block-bits
-           #:commitment-layout #:declare-units
+           #:commitment-layout #:declare-units #:mlp-slices #:layer-groups #:layer-weight-groups
+           #:shape-t* #:shape-tt #:shape-cb #:shape-cbv #:shape-ldh #:shape-kd #:shape-kq #:shape-kk #:shape-kf
+           #:shape-kv #:shape-nh #:shape-nkv #:shape-grp #:shape-b #:shape-s #:shape-r #:shape-ng #:shape-hb
+           #:shape-cfg #:p-cols
            #:policy #:make-policy #:encode-policy #:check-statement
            #:statement #:sampling-seed #:weights-digest #:+theta-count+))
 
@@ -175,16 +178,18 @@ within P_PAD of the tiles."
 
 (defun commitment-layout (cfg shape &key (theta 0) (cmax 23))
   "The commitment layout of a proof (llm.Proto.declare), as data: the groups in declaration order,
-each (name items) with its items (name K c) as the commitment sees them (packed); the merge sets
-(one per layer); and the segments (one per layer)."
+each (name items) with its items (name K c) as the commitment sees them (packed); the same groups
+unpacked, (name items pad) with items (name K c [shape]) as the protocol context declares them; the
+merge sets (one per layer); and the segments (one per layer)."
   (let* ((tt (shape-t* shape)) (cb (shape-cb shape)) (ldh (shape-ldh shape))
          (kd (shape-kd shape)) (kq (shape-kq shape)) (kk (shape-kk shape)) (kf (shape-kf shape))
          (kv (shape-kv shape)) (cbv (shape-cbv shape)) (nh (shape-nh shape)) (grp (shape-grp shape))
-         (groups '()))
+         (groups '()) (raw '()))
     (labels ((cat (&rest parts) (apply #'concatenate 'string parts))
              (rows (pre fields) (loop for f in fields collect (list (cat pre f) 1 tt)))
              (jb (pre k) (list (list (cat pre "jb") (+ cb (nbits k)) tt)))
              (group (name items &optional (pad *pack-pad*))
+               (push (list name items pad) raw)
                (push (list name (packed-items items cmax pad)) groups)))
       (dotimes (l (cfg-l cfg))
         (let* ((p (format nil "~D." l))
@@ -275,6 +280,7 @@ each (name items) with its items (name K c) as the commitment sees them (packed)
       (group "rope" (list (list "rope.cos" 1 (+ ldh -1 tt)) (list "rope.sin" 1 (+ ldh -1 tt)))))
     (let ((layers (loop for l below (cfg-l cfg) collect l)))
       (list :groups (nreverse groups)
+            :raw-groups (nreverse raw)
             :merges (mapcar (lambda (l) (layer-groups cfg shape l)) layers)
             :segments (mapcar (lambda (l) (append (layer-groups cfg shape l) (layer-weight-groups cfg l))) layers)
             :weight-groups (append (loop for l in layers append (layer-weight-groups cfg l)) (list "Wlm" "emb"))))))

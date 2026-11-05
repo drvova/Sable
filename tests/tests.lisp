@@ -905,14 +905,17 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
     (export-pcs-cases "6ade2c3e6acad8ce06eea085b01b9534d625ff4476f7d970a2b3376949378d37")
     (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
     (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce")
-    (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c"))
+    (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c")
+    (export-step-mo-cases "00348957a008539af802f9075518564012739cdf1a4e5376ae4880a549cd6710"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
 rejected 287 forgeries, and zk/llm.py computed the same 18 layouts, 9 statements and seeds,
 10 statement checks and C_W; and zk/proto.py's Ctx replayed the context scenario, computed the
 same values and rejected its 95 forgeries; Sable's logup.table_side, at 2^9 rows, replayed the
-table-side scenario with the same claims and chunk sums and rejected its 172 forgeries.  The files differ from those only in the proof magic
+table-side scenario with the same claims and chunk sums and rejected its 172 forgeries; Sable's
+Proto.step_mo replayed the tiny model's layer-0 MLP output step, left the same claims on 44 tensors,
+virtual claims and down-projection partials, and rejected all 1542 forgeries.  The files differ from those only in the proof magic
 (EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
@@ -1349,3 +1352,103 @@ model files and tokens.")
 (defun test-model-forward ()
   (loop for (name . pins) in *model-fingerprints*
         do (assert (equal (model-fingerprints name) pins) () "F_O of ~A differs" name)))
+
+;;; ------------------------------------------------------------------ the per-layer steps
+
+(defun step-shape (model)
+  (let ((cfg (exacta.model:model-cfg model)))
+    (multiple-value-bind (cb cbv) (exacta.llm:column-block-bits cfg)
+      (exacta.llm:make-shape cfg 2 256 cb cbv 16))))
+
+(defun step-witness (name l)
+  "Layer L's witness of model NAME on the tokens from seed 5."
+  (let* ((model (cdr (assoc name *test-models* :test #'string=)))
+         (shape (step-shape model))
+         (tables (exacta.model:model-tables model 256))
+         (h (exacta.model:embed-tokens model (let ((state (sb-ext:seed-random-state 5)))
+                                              (coerce (loop repeat 512 collect (random 1024 state)) 'vector)))))
+    (dotimes (i l) (setf h (exacta.model:layer-forward model (aref (exacta.model:model-layers model) i) h 2 256 tables)))
+    (values (exacta.steps:layer-witness model l h shape tables) model shape)))
+
+(defun step-run (model shape l step group tensors &optional witness messages)
+  "One step of layer L in isolation (prover with WITNESS, or verifier of MESSAGES): the layout's
+groups declared without merge sets or segments, GROUP committed (from TENSORS), the step's lookups
+counted and assigned, Z and beta drawn, the layer's header, the step.  Returns what it left: every
+pending claim, the virtual claims and the step's state."
+  (let* ((tr (if messages (make-transcript "step-test" 4 :messages messages) (make-transcript "step-test" 4)))
+         (context (exacta.proto:make-context (if messages :verify :prove) tr :queries 6 :grind 4))
+         (state (exacta.steps::make-step-state))
+         (layout (exacta.llm:commitment-layout (exacta.model:model-cfg model) shape)))
+    (loop for (name items pad) in (getf layout :raw-groups)
+          do (exacta.proto:declare-group context name items :pad pad))
+    (exacta.proto:commit-group context group (and witness (funcall tensors witness)))
+    (let ((assignments
+            (when witness
+              (let ((chunks (exacta.tables:make-chunks)))
+                (setf (exacta.proto::context-mode context) :commit
+                      (exacta.proto:context-counter context) (lambda (domain) (exacta.tables:count-lookups chunks domain)))
+                (setf exacta.steps::*layer-parameters* (exacta.steps:layer-parameters model l))
+                (funcall step context model shape l (exacta.steps::make-step-state) witness)
+                (setf (exacta.proto::context-mode context) :prove)
+                (exacta.tables:chunks-assignments chunks)))))
+      (setf (exacta.proto:context-assign context)
+            (exacta.proto:parse-assign (send-bytes tr (and witness (exacta.proto:assign-octets assignments))))))
+    (exacta.proto:draw-lookup-challenges context)
+    (exacta.steps::layer-head context model l)
+    (funcall step context model shape l state witness)
+    (values (list :claims (sort (loop for name being the hash-keys of (exacta.proto::context-claims context)
+                                      collect (cons name (gethash name (exacta.proto::context-claims context))))
+                                #'string< :key #'car)
+                  :wclaims (sort (loop for name being the hash-keys of (exacta.proto::context-wclaims context)
+                                       collect (cons name (gethash name (exacta.proto::context-wclaims context))))
+                                 #'string< :key #'car)
+                  :virtual (sort (loop for key being the hash-keys of (exacta.proto::context-virtual context)
+                                       collect (cons key (gethash key (exacta.proto::context-virtual context))))
+                                 #'string< :key (lambda (k) (format nil "~S" (car k))))
+                  :state state)
+            tr)))
+
+(defun json-claims (alist)
+  "Pending block claims: {name: [[point, [[block, value], ...]], ...]}."
+  (format nil "{~{~A~^,~}}"
+          (loop for (name . claims) in alist
+                collect (format nil "\"~A\": [~{~A~^,~}]" name
+                                (loop for (point values) in claims
+                                      collect (format nil "[~A, [~{~A~^,~}]]" (json-point point)
+                                                      (loop for (b . v) in values collect (format nil "[~D, ~A]" b (json-ext v)))))))))
+
+(defun json-wclaims (alist)
+  (format nil "{~{~A~^,~}}"
+          (loop for (name . claims) in alist
+                collect (format nil "\"~A\": [~{~A~^,~}]" name
+                                (loop for (point weights value) in claims
+                                      collect (format nil "[~A, [~{~A~^,~}], ~A]" (json-point point)
+                                                      (loop for (b . v) in weights collect (format nil "[~D, ~A]" b (json-ext v)))
+                                                      (json-ext value)))))))
+
+(defun export-step-mo-cases (path)
+  "Write step_mo of the tiny model's layer 0 (proof and everything it left), as JSON.  Sable's
+Proto.step_mo replayed exactly this; TEST-FROZEN-CASES pins it."
+  (multiple-value-bind (w model shape) (step-witness "tiny" 0)
+    (let ((tensors (lambda (w) (list (cons "0.s2" (exacta.steps:rm-layout (getf w :s2) (exacta.llm:shape-cb shape)))
+                                     (cons "0.os2" (exacta.steps:rm-layout (getf w :os2) (exacta.llm:shape-cb shape)))))))
+      (multiple-value-bind (proved tr) (step-run model shape 0 #'exacta.steps:step-mo "0.mo" tensors w)
+        (declare (ignore proved))
+        (let* ((messages (transcript-messages tr))
+               (out (step-run model shape 0 #'exacta.steps:step-mo "0.mo" tensors nil messages))
+               (state (getf out :state)))
+          (with-open-file (s path :direction :output :if-exists :supersede)
+            (format s "{\"proof\": \"~(~{~2,'0X~}~)\", \"layer\": 0,~%" (coerce (exacta.proofio:encode-proof messages) 'list))
+            (format s "\"claims\": ~A,~%\"wclaims\": ~A,~%" (json-claims (getf out :claims)) (json-wclaims (getf out :wclaims)))
+            (format s "\"virtual\": {~{~A~^,~}},~%"
+                    (loop for ((l key) . items) in (getf out :virtual)
+                          collect (format nil "\"~D|~A\": [~{~A~^,~}]" l key
+                                          (loop for (point values) in items
+                                                collect (format nil "[~A, ~A]" (json-point point) (json-vector values))))))
+            (format s "\"down\": [~{~A~^,~}],~%"
+                    (loop for (po pm parts) in (exacta.steps::step-state-down-claims state)
+                          collect (format nil "[~A, ~A, ~A]" (json-point po) (json-point pm) (json-vector parts))))
+            (format s "\"gather\": {~{~A~^,~}}}~%"
+                    (loop for (key point value) in (exacta.steps::step-state-gather state)
+                          collect (format nil "\"~A\": [~A, ~A]" key (json-point point) (json-ext value)))))))))
+  path)

@@ -30,6 +30,7 @@ commitment and the transformer statement.  Ported from Sable's Python implementa
                (:file "public")
                (:file "llm")
                (:file "model")
+               (:file "steps")
                (:file "toplevel"))
   :in-order-to ((test-op (test-op "exacta/tests"))))
 
