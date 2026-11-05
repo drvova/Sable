@@ -405,10 +405,6 @@ split into per-slice partial sums."
       (loop for v across final
             unless (ext= v e) do (reject :sumcheck "~A: eq table final" label)))))
 
-(defun ext-eq1 (x y)
-  "eq(x, y) = x y + (1 - x)(1 - y)."
-  (ext+ (ext* x y) (ext* (ext- (ext-one 4) x) (ext- (ext-one 4) y))))
-
 (defun col-dot (a e kin mrows width)
   "Per column x of A (rm layout: KIN blocks of MROWS rows of WIDTH): sum_m e[m] A[block][m][x]."
   (let ((out (make-array (* kin width))))
