@@ -14,7 +14,7 @@
            #:commitment-layout #:declare-units #:mlp-slices #:layer-groups #:layer-weight-groups
            #:shape-t* #:shape-tt #:shape-cb #:shape-cbv #:shape-ldh #:shape-kd #:shape-kq #:shape-kk #:shape-kf
            #:shape-kv #:shape-nh #:shape-nkv #:shape-grp #:shape-b #:shape-s #:shape-r #:shape-ng #:shape-hb
-           #:shape-cfg #:p-cols
+           #:shape-cfg #:shape-nbb #:p-cols
            #:policy #:make-policy #:encode-policy #:check-statement
            #:statement #:sampling-seed #:weights-digest #:+theta-count+))
 

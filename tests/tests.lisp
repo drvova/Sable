@@ -906,7 +906,8 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
     (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
     (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce")
     (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c")
-    (export-step-mi-cases "04a96b486434957a2442ed7188768fae281c669095290b1c57728dcd42b8ed6e"))
+    (export-step-mi-cases "04a96b486434957a2442ed7188768fae281c669095290b1c57728dcd42b8ed6e")
+    (export-step-ao-cases "89b2126a52556680aed5c7bd533b8eb3d314a73e2daeffabafc5e140fbc80d72"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
@@ -918,7 +919,9 @@ Proto.step_mo replayed the tiny model's layer-0 MLP output step, left the same c
 virtual claims and down-projection partials, and rejected all 1542 forgeries; with the MLP slice
 after it (step_mlp), the same claims on 48 tensors and one-hot claims, all 2211 forgeries rejected;
 then the MLP input (step_mi), the same claims on 5 tensors, all 2749 forgeries rejected.  Only the
-cumulative step case is pinned: its proof holds the earlier steps' messages.  The files differ from those only in the proof magic
+cumulative step case is pinned: its proof holds the earlier steps' messages.  The attention
+output (step_ao, alone): the same claims on 5 tensors and virtual claims, all 2005 forgeries
+rejected.  The files differ from those only in the proof magic
 (EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
@@ -1443,8 +1446,8 @@ pending claim, the virtual claims and the step's state."
             (format s "{\"proof\": \"~(~{~2,'0X~}~)\", \"layer\": 0,~%" (coerce (exacta.proofio:encode-proof messages) 'list))
             (format s "\"claims\": ~A,~%\"wclaims\": ~A,~%" (json-claims (getf out :claims)) (json-wclaims (getf out :wclaims)))
             (format s "\"virtual\": {~{~A~^,~}},~%"
-                    (loop for ((l key) . items) in (getf out :virtual)
-                          collect (format nil "\"~D|~A\": [~{~A~^,~}]" l key
+                    (loop for (key . items) in (getf out :virtual)
+                          collect (format nil "\"~A\": [~{~A~^,~}]" (if (stringp key) key (format nil "~{~A~^|~}" key))
                                           (loop for (point values) in items
                                                 collect (format nil "[~A, ~A]" (json-point point) (json-vector values))))))
             (format s "\"down\": [~{~A~^,~}],~%"
@@ -1481,6 +1484,7 @@ TEST-FROZEN-CASES pins it."
                (list (cons "0.m0.c" (rm (getf mlp :c))) (cons "0.m0.a" (rm (getf mlp :a)))
                      (cons "0.m0.qu" (rm (getf (getf w :ru) :q))) (cons "0.m0.qm" (rm (getf (getf w :rm) :q))))))
             ((string= group "0.mi") (mi-tensors w cb))
+            ((string= group "0.ao") (ao-tensors w cb (exacta.llm:shape-ldh shape)))
             (t (error "step-tensors: ~A" group))))))
 
 (defun mi-tensors (w cb)
@@ -1516,3 +1520,31 @@ this; TEST-FROZEN-CASES pins it."
   (exacta.steps:step-mo context model shape l state witness)
   (dotimes (s (length (exacta.llm:mlp-slices shape)) state)
     (exacta.steps:step-mlp context model shape l state witness s)))
+
+(defun ao-tensors (w cb ldh)
+  "G_ao's tensors (Proto.tensors \"ao\")."
+  (flet ((rm (m c) (exacta.steps:rm-layout m c))
+         (rows (v) (map 'vector (lambda (x) (mod x +p+)) v))
+         (raw-heads (m) (make-array (array-total-size m) :displaced-to m :element-type (array-element-type m)))
+         (heads (m) (map 'vector (lambda (x) (mod x +p+)) (make-array (array-total-size m) :displaced-to m :element-type (array-element-type m))))
+         (field-of (pack name) (getf pack (intern (string-upcase name) :keyword))))
+    (let ((nd (getf w :nd)) (ro (getf w :ro)))
+      (append (loop for (pre key) in '(("nE." :e) ("nM." :kp))
+                    append (let ((pack (exacta.steps:sr-pack (raw-heads (getf nd key)))))
+                             (loop for f in '("k" "s" "R" "tR" "tB" "oB")
+                                   collect (cons (format nil "0.~A~A" pre f) (rows (field-of pack f))))))
+              (loop for (f key) in '(("delta" :delta) ("rhoD" :rhod) ("recip" :recip) ("fk" :fk))
+                    collect (cons (format nil "0.nd.~A" f) (heads (getf nd key))))
+              (list (cons "0.nd.xh" (rm (getf w :ndxh) ldh)) (cons "0.nd.t" (rm (getf w :ndt) ldh))
+                    (cons "0.o" (rm (getf w :o) cb)) (cons "0.qo" (rm (getf ro :q) cb)))
+              (loop for f in '("e" "s" "f" "sig" "wl" "wh") collect (cons (format nil "0.ro.~A" f) (rows (field-of ro f))))
+              (list (cons "0.ro.jb" (rows (apply #'concatenate 'vector (getf ro :jb)))))
+              (let ((so (exacta.steps:sr-pack (getf w :ko))))
+                (loop for f in '("k" "s" "R" "tR" "tB" "oB" "tA" "oA" "f")
+                      collect (cons (format nil "0.so.~A" f) (rows (field-of so f)))))
+              (list (cons "0.s1" (rm (getf w :s1) cb)) (cons "0.os1" (rm (getf w :os1) cb)))))))
+
+(defun export-step-ao-cases (path)
+  "step_ao of the tiny model's layer 0, alone.  Sable's Proto replayed exactly this; TEST-FROZEN-CASES
+pins it."
+  (export-step-case path #'exacta.steps:step-ao '("0.ao")))

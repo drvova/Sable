@@ -18,7 +18,7 @@
            #:db #:make-db #:db-column #:db-zero #:db-lookup #:db-run
            #:route-block #:route-virtual #:route-public
            #:rq-rows #:ns-rows #:sr-rows #:cap-col #:combine-blocks
-           #:layer-parameters #:layer-head #:step-mo #:step-mlp #:step-mi #:step-state #:matmul #:oh-check #:gather-rowsum #:rq-norm-dom))
+           #:layer-parameters #:layer-head #:step-mo #:step-mlp #:step-mi #:step-ao #:with-domain-batch #:step-state #:matmul #:oh-check #:gather-rowsum #:rq-norm-dom))
 
 (in-package #:exacta.steps)
 
@@ -75,7 +75,10 @@ jstar (cb low bits, then the block's)."
 
 (defun sr-pack (k)
   "The SR and SRA rows of the per-row shifts K (llm.sr_pack): k + 16, s, R, tR, tB, oB, tA, oA, f."
-  (let ((rows (map 'list (lambda (x) (append (sr-row x) (rest (sra-row x)))) k)))
+  (let ((rows (map 'list (lambda (x)
+                          (witness (<= -16 x 24) "SR: shift outside [-16, 24]")
+                          (append (sr-row x) (rest (sra-row x))))
+                   k)))
     (loop for name in '(:k :s :r :tr :tb :ob :ta :oa :f)
           for i from 0
           collect name
@@ -87,8 +90,9 @@ jstar (cb low bits, then the block's)."
 
 (defun sign-of (x) (signum x))
 
-(defun layer-witness (model l h shape tables)
-  "Layer L's witness on its input rows H (llm.LayerWit, the values the steps read so far)."
+(defun layer-witness (model l h shape tables &optional prev)
+  "Layer L's witness on its input rows H (llm.LayerWit, the values the steps read so far); PREV, the
+previous layer's witness (its output's SatAdd values are this layer's input columns)."
   (let* ((cfg (model-cfg model))
          (layer (aref (model-layers model) l))
          (cb (shape-cb shape)))
@@ -109,7 +113,12 @@ jstar (cb low bits, then the block's)."
               :r2 r2 :n2 n2
               :eg (list :e eg :pe (map 'vector #'p2 eg) :f (map 'vector (lambda (e) (if (< e kgl) 1 0)) (getf n2 :eh)))
               :ru (rq-pack (getf mlp :accu) cb 2 22)
-              :rm (rq-pack (getf mlp :m) cb))))))
+              :rm (rq-pack (getf mlp :m) cb)
+              :acc-o (getf w :acc-o) :o (getf w :o) :ns (getf w :ns) :ndxh (getf w :ndxh) :ndt (getf w :ndt)
+              :nd (getf w :nd)
+              :ro (rq-pack (getf w :o) cb)
+              :ko (map 'vector (lambda (e) (- (layer-value layer "Kco") e)) (getf w :eo))
+              :prev prev)))))
 
 (defun map-matrix2 (f a b)
   (let ((out (make-matrix (rows a) (columns a))))
@@ -145,7 +154,15 @@ ROUTE.  Returns the column's symbol, for forms."
 
 (defvar *layer-parameters* '() "The layer parameters of the layer being proved (dm.set_lparams).")
 
+(defvar *domain-batch* nil
+  "Inside WITH-DOMAIN-BATCH: the domains run so far (they are proved when the batch closes).")
+
 (defun db-run (db)
+  (if *domain-batch*
+      (vector-push-extend db *domain-batch*)
+      (run-db db)))
+
+(defun run-db (db)
   (run-domain (db-context db)
               (make-domain :name (db-name db) :n (db-n db) :blocks (db-k db) :merge (db-merge db)
                            :columns (db-columns db) :constraints (db-constraints db) :lookups (db-lookups db)
@@ -425,11 +442,12 @@ split into per-slice partial sums."
           (let ((v (aref w r c))) (unless (zerop v) (setf acc (ext+ acc (ext-scale (aref e c) (field v)))))))
         (setf (aref out r) acc)))))
 
-(defun matmul (context label a-name a-data kin mrows w-nat kout cb claims weight-claim &key (cbo cb))
+(defun matmul (context label a-name a-data kin mrows w-nat kout cb claims weight-claim &key (cbo cb) defer-weights)
   "Claims (po pm value) on acc = A W, A row-major (MROWS x KIN 2^cb, A-DATA in rm layout) and W
 natural (KIN 2^cb x KOUT 2^cbo), reduced by one sumcheck over the inner index to claims on A's
 blocks and on W's blocks (tb, ob), in-block (o' low, t' high); WEIGHT-CLAIM receives those (point
-values) (llm.matmul)."
+values) (llm.matmul): within the loop, or after it with DEFER-WEIGHTS (Proto.matmul_rows and
+matmul_cols claim a temporary tensor and move the claims to the weight tensor afterwards)."
   (when claims
     (let* ((nin (* kin (expt 2 cb))) (nout (* kout (expt 2 cbo)))
            (gam (context-challenge context (length claims)))
@@ -445,8 +463,6 @@ values) (llm.matmul)."
                                           (list wn :full 0 nil (row-dot w-nat (eq-table po 4) nin nout)))
                                     (list (list an :full 0 nil nil) (list wn :full 0 nil nil))))))
       (multiple-value-bind (rho finals) (run-sumcheck context label cb kin statement claim tables :constants constants)
-        ;; the weight claims are made after the loop: Sable puts them on a temporary tensor and moves
-        ;; them to the (packed) weight tensor, drawing its combination challenge, only then
         (loop with weight-claims = '()
               for (po pm) in claims
               for i from 0
@@ -461,7 +477,9 @@ values) (llm.matmul)."
                        (unless (ext= (block-combination context tau (subseq vals (* tb kout) (* (1+ tb) kout)))
                                      (aref (nth (1+ (* 2 i)) finals) tb))
                          (reject :matmul "matmul ~A: weight block values inconsistent" label))))
-                   (push (list (append po-low rho) vals) weight-claims))
+                   (if defer-weights
+                       (push (list (append po-low rho) vals) weight-claims)
+                       (funcall weight-claim (append po-low rho) vals)))
               finally (loop for (point vals) in (reverse weight-claims) do (funcall weight-claim point vals)))))))
 
 (defun weight-block-values (w po-low rho kin kout cb cbo)
@@ -640,7 +658,8 @@ and up products, and the opening of G_mlp<s>."
                       (lambda (point vals)
                         (claim context (s+ p "Wd") point
                                (loop for v across vals for b from 0
-                                     collect (cons (+ (* (+ b0 (floor b kd)) kd) (mod b kd)) v)))))
+                                     collect (cons (+ (* (+ b0 (floor b kd)) kd) (mod b kd)) v))))
+                      :defer-weights t)
               ;; the gate and up products
               (flet ((combined (key)
                        (loop for (point values) in (take-virtual context (list l s key))
@@ -654,7 +673,8 @@ and up products, and the opening of G_mlp<s>."
                                      (lambda (point vals)
                                        (claim context wname point
                                               (loop for v across vals for b from 0
-                                                    collect (cons (+ (* (floor b ks) kf) b0 (mod b ks)) v)))))))))))
+                                                    collect (cons (+ (* (floor b ks) kf) b0 (mod b ks)) v))))
+                                     :defer-weights t)))))))
           (open-group context (format nil "~D.mlp~D" l s)))))
     state))
 
@@ -768,3 +788,218 @@ sumcheck of its minimality and squared sum; the opening of G_mi."
                          (s+ p "r2.jb") (lambda () (getf (getf w :r2) :jb)) cb)))
       (open-group context (s+ p "mi")))
     state))
+
+;;; ------------------------------------------------------------------ domain batches
+
+(defmacro with-domain-batch (() &body body)
+  "Domains run in BODY are proved together when it ends (llm.domain_batch): those of one shape (n,
+K, merge) as one merged domain, in order of first appearance.  BODY must not read their claims."
+  `(let ((*domain-batch* (make-array 0 :adjustable t :fill-pointer t)))
+     (multiple-value-prog1 (progn ,@body)
+       (run-domain-batch *domain-batch*))))
+
+(defun run-domain-batch (batch)
+  (let ((*domain-batch* nil)
+        (groups '()))
+    (loop for db across batch
+          do (let* ((key (list (db-n db) (db-k db) (db-merge db)))
+                    (group (assoc key groups :test #'equal)))
+               (if group
+                   (setf (cdr group) (append (cdr group) (list db)))
+                   (setf groups (append groups (list (list key db)))))))
+    (loop for (nil . dbs) in groups
+          do (run-db (if (rest dbs) (merge-dbs dbs) (first dbs))))))
+
+(defun merge-dbs (dbs)
+  "One domain of the columns, constraints and lookups of DBS (llm.merge_domains): column names
+prefixed by the domain's position, routes following them."
+  (let* ((first (first dbs))
+         (merged (%make-db (db-context first) (format nil "~{~A~^|~}" (mapcar #'db-name dbs))
+                           (db-n first) (db-k first) (db-merge first))))
+    (loop for db in dbs
+          for j from 0
+          do (let ((renames (loop for (symbol) in (db-columns db)
+                                  collect (cons symbol (column-symbol (format nil "~D:~A" j (symbol-name symbol)))))))
+               (setf (db-columns merged)
+                     (append (db-columns merged)
+                             (loop for (symbol . options) in (db-columns db)
+                                   collect (cons (cdr (assoc symbol renames)) options)))
+                     (db-routes merged)
+                     (append (db-routes merged)
+                             (loop for (symbol . route) in (db-routes db)
+                                   collect (cons (cdr (assoc symbol renames)) route)))
+                     (db-lookups merged)
+                     (append (db-lookups merged)
+                             (loop for lookup in (db-lookups db)
+                                   collect (destructuring-bind (&key tag values num dynamic) lookup
+                                             (list :tag (sublis renames tag) :values (sublis renames values)
+                                                   :num (and num (sublis renames num)) :dynamic dynamic))))
+                     (db-constraints merged)
+                     (append (db-constraints merged) (sublis renames (db-constraints db))))))
+    merged))
+
+;;; ------------------------------------------------------------------ the attention output
+
+(defun hin-cols (context db l w cb &key pre post)
+  "The layer's residual input as a form over columns of DB (Proto.hin_cols): the embedding rows
+(a virtual column) in layer 0, else the previous layer's SatAdd values."
+  (if (zerop l)
+      (db-column db "h0" (lambda () (rm-layout (getf w :hin) cb)) (route-virtual context "h0"))
+      (let ((q (format nil "~D." (1- l))))
+        (hexpr (db-column db (s+ q "s2") (lambda () (rm-layout (getf (getf w :prev) :s2) cb))
+                          (route-block context (s+ q "s2") :pre pre :post post))
+               (db-column db (s+ q "os2") (lambda () (rm-layout (getf (getf w :prev) :os2) cb))
+                          (route-block context (s+ q "os2") :pre pre :post post))))))
+
+(defun head-rows (m)
+  "An (nh x T) matrix's rows, head-major, as one vector."
+  (let ((out (make-array (array-total-size m))))
+    (dotimes (i (array-total-size m) out) (setf (aref out i) (row-major-aref m i)))))
+
+(defun step-ao (context model shape l state witness)
+  "The attention output (Proto.step_ao): the O-projection's shift and SatAdd, the per-row Requant8
+of o and SR(k_o), Requant8(o) over its elements, o = MulRound(N, recip, k) elementwise, the per
+(row, head) denominator Norm and shifts -- one domain batch -- then o's point claim, the numerator
+and denominator claims for the attention groups, the gather of Requant8(o), the O-projection
+product and the opening of G_ao."
+  (let* ((layer (aref (model-layers model) l))
+         (cb (shape-cb shape)) (tt (shape-t* shape)) (kd (shape-kd shape)) (kq (shape-kq shape))
+         (ldh (shape-ldh shape)) (nh (shape-nh shape)) (nkv (shape-nkv shape)) (grp (shape-grp shape))
+         (p (format nil "~D." l))
+         (w witness)
+         (nd (getf w :nd)))
+    (with-domain-batch ()
+      ;; the O-projection's shift + SatAdd over T x d
+      (let* ((db (make-db context (s+ p "oproj") (+ cb tt) :k kd))
+             (acc (db-column db "acco" (lambda () (rm-layout (getf w :acc-o) cb)) (route-virtual context (list l "acco"))))
+             (s1 (db-column db (s+ p "s1") (lambda () (rm-layout (getf w :s1) cb)) (route-block context (s+ p "s1"))))
+             (o1 (db-column db (s+ p "os1") (lambda () (rm-layout (getf w :os1) cb)) (route-block context (s+ p "os1"))))
+             (h (hin-cols context db l w cb))
+             (pack (and w (sr-pack (getf w :ko))))
+             (sr (loop for f in (append (remove "k" +sr-f+ :test #'string=) +sra-f+)
+                       collect (let ((f f))
+                                 (cons f (db-column db (s+ p "so." f) (lambda () (sr-field pack f))
+                                                    (route-block context (s+ p "so." f)) :kind :row :c cb :shared t)))))
+             (c1 `(- ,s1 ,h)))
+        (flet ((sr (f) (cdr (assoc f sr :test #'string=))))
+          (db-lookup db (sr "tR") (list `(- (+ ,acc ,(sr "R")) (* ,(sr "s") ,c1))))
+          (db-lookup db (sr "tB") (list `(+ ,c1 ,(sr "oB"))))
+          (db-lookup db (sr "tA") (list `(+ (* ,(sr "f") ,acc) ,(sr "oA"))))
+          (db-lookup db 24 (list (satlookup s1 o1)))
+          (db-zero db `(- (* ,o1 ,o1 ,o1) ,o1)))
+        (db-run db))
+      ;; per row: Requant8(o) minimality + SR(k_o)
+      (let* ((db (make-db context (s+ p "ao.rows") tt))
+             (ro (rq-rows context db (s+ p "ro.") (getf w :ro) kq :asel-key (list l "aselo") :shape-cb cb)))
+        (sr-rows context db (s+ p "so.") (getf w :ko) `(- kco ,(cdr (assoc "e" ro :test #'string=))) :left t)
+        (db-run db))
+      ;; Requant8(o) over T x nq
+      (let* ((db (make-db context (s+ p "rqo") (+ cb tt) :k kq))
+             (o (db-column db (s+ p "o") (lambda () (rm-layout (getf w :o) cb)) (route-block context (s+ p "o"))))
+             (qo (db-column db (s+ p "qo") (lambda () (rm-layout (getf (getf w :ro) :q) cb)) (route-block context (s+ p "qo"))))
+             (e (db-column db (s+ p "ro.e") (lambda () (getf (getf w :ro) :e)) (route-block context (s+ p "ro.e")) :kind :row :c cb :shared t))
+             (s (db-column db (s+ p "ro.s") (lambda () (getf (getf w :ro) :s)) (route-block context (s+ p "ro.s")) :kind :row :c cb :shared t)))
+        (db-lookup db `(+ ,e 1) (list `(+ (- (* 2 ,o) (* 2 ,s ,qo)) ,s)))
+        (db-lookup db exacta.tables:+star8+ (list `(+ ,qo 127)))
+        (db-run db))
+      ;; o = MulRound(N, recip, k) elementwise over (c, m) x nh
+      (let* ((db (make-db context (s+ p "nd") (+ ldh tt) :k nh))
+             (n (db-column db "Nsum" (lambda () (rm-layout (getf w :ns) ldh)) (route-virtual context (list l "Nsum"))))
+             (xh (db-column db (s+ p "nd.xh") (lambda () (rm-layout (getf w :ndxh) ldh)) (route-block context (s+ p "nd.xh"))))
+             (tt* (db-column db (s+ p "nd.t") (lambda () (rm-layout (getf w :ndt) ldh)) (route-block context (s+ p "nd.t"))))
+             (ov (db-column db "o_view" (lambda () (rm-layout (getf w :o) ldh)) (route-virtual context (list l "o_view"))))
+             (kp-pack (and w (sr-pack (head-rows (getf nd :kp)))))
+             (sm (loop for f in (remove "k" +sr-f+ :test #'string=)
+                       collect (let ((f f))
+                                 (cons f (db-column db (s+ p "nM." f) (lambda () (sr-field kp-pack f))
+                                                    (route-block context (s+ p "nM." f)) :kind :row :c ldh)))))
+             (rc (db-column db (s+ p "nd.recip") (lambda () (head-rows (getf nd :recip)))
+                            (route-block context (s+ p "nd.recip")) :kind :row :c ldh))
+             (xl `(- ,n (* ,(expt 2 12) ,xh))))
+        (flet ((sm (f) (cdr (assoc f sm :test #'string=))))
+          (db-lookup db 12 (list xl))
+          (db-lookup db 12 (list `(+ ,xh ,(expt 2 11))))
+          (db-lookup db 12 (list `(- (* ,xl ,rc) (* ,(expt 2 12) ,tt*))))
+          (db-lookup db 18 (list `(+ ,tt* ,(expt 2 17))))
+          (db-lookup db (sm "tR") (list `(- (+ (* ,xh ,rc) ,tt* ,(sm "R")) (* ,(sm "s") ,ov))))
+          (db-lookup db (sm "tB") (list `(+ ,ov ,(sm "oB")))))
+        (db-run db))
+      ;; per (row, head): D = 2^E delta + rhoD, recip, k_m = max(7, E), the MulRound shift
+      (let* ((db (make-db context (s+ p "nd.rows") tt :k nh))
+             (dc (db-column db "D" (lambda () (head-rows (getf nd :d))) (route-virtual context (list l "D"))))
+             (e-pack (and w (sr-pack (head-rows (getf nd :e)))))
+             (kp-pack (and w (sr-pack (head-rows (getf nd :kp)))))
+             (km-pack (and w (sr-pack (head-rows (getf nd :km)))))
+             (sre (loop for f in +sr-f+
+                        collect (let ((f f)) (cons f (db-column db (s+ p "nE." f) (lambda () (sr-field e-pack f)) (route-block context (s+ p "nE." f)))))))
+             (srm (loop for f in +sr-f+
+                        collect (let ((f f)) (cons f (db-column db (s+ p "nM." f) (lambda () (sr-field kp-pack f)) (route-block context (s+ p "nM." f)))))))
+             (nc (loop for (f key) in '(("delta" :delta) ("rhoD" :rhod) ("recip" :recip) ("fk" :fk))
+                       collect (let ((key key))
+                                 (cons f (db-column db (s+ p "nd." f) (lambda () (head-rows (getf nd key))) (route-block context (s+ p "nd." f)))))))
+             (kmc (db-column db "nKk" (lambda () (sr-field km-pack "k"))
+                             (lambda (point value)
+                               (dotimes (g nkv)
+                                 (claim context (format nil "~D.g~D.nK.k" l g) point
+                                        (loop for i below grp collect (cons i (aref value (+ (* g grp) i)))))))))
+             (vsh (layer-value layer "vshift"))
+             (vs (db-column db "vshift" (subseq vsh 0 nh)
+                            (route-public context (lambda (point) (declare (ignore point))
+                                                    (map 'vector (lambda (v) (base->ext (field v) 4)) (subseq vsh 0 nh))))
+                            :kind :row :c tt)))
+        (flet ((sre (f) (cdr (assoc f sre :test #'string=)))
+               (srm (f) (cdr (assoc f srm :test #'string=)))
+               (nc (f) (cdr (assoc f nc :test #'string=))))
+          (let ((e `(- ,(sre "k") 16))
+                (km `(- ,kmc 16))
+                (fk (nc "fk")))
+            (db-lookup db exacta.tables:+sr+ (mapcar #'sre +sr-f+))
+            (db-lookup db exacta.tables:+sr+ (mapcar #'srm +sr-f+))
+            (db-lookup db (sre "tR") (list (nc "rhoD")))
+            (db-lookup db exacta.tables:+recip+ (list `(- ,(nc "delta") ,(expt 2 15)) (nc "recip")))
+            (db-zero db `(- ,dc (* ,(sre "s") ,(nc "delta")) ,(nc "rhoD")))
+            (db-zero db `(* ,fk (- 1 ,fk)))
+            (db-lookup db 4 (list `(+ (* ,fk (- ,e 7)) (* (- 1 ,fk) (- 6 ,e)))))
+            (db-lookup db 5 (list `(+ ,e 5)))
+            (db-lookup db 5 (list `(- 14 ,e)))
+            (db-lookup db 22 (list `(* (- 1 ,fk) ,dc)))
+            (db-zero db `(- ,km 7 (* ,fk (- ,e 7))))
+            (db-zero db `(- (- ,(srm "k") 16) (+ 13 (- ,e ,km) ,vs)))))
+        (db-run db)))
+    (when (active-p context)
+      ;; o's view claims -> a point claim on o (head block hh -> o's columns hh dh + c)
+      (loop for (point values) in (take-virtual context (list l "o_view"))
+            do (let* ((ptc (subseq point 0 ldh)) (ptm (nthcdr ldh point))
+                      (tau (context-challenge context (nbits nh)))
+                      (v (block-combination context tau values))
+                      (lh (log2* (shape-hb shape))))
+                 (point-claim context (s+ p "o") (append ptc (subseq tau 0 lh) ptm (nthcdr lh tau))
+                              :value v :data (and (prover-p context) (rm-layout (getf w :o) cb)))))
+      ;; Nsum -> Nr, summed over the key blocks
+      (loop for (point values) in (take-virtual context (list l "Nsum"))
+            do (let* ((nbb (shape-nbb shape))
+                      (half (loop repeat nbb collect (base->ext +inv2+ 4)))
+                      (scale (fpow +inv2+ nbb)))
+                 (dotimes (g nkv)
+                   (claim context (format nil "~D.g~D.Nr" l g) (append (subseq point 0 ldh) half (nthcdr ldh point))
+                          (loop for i below grp collect (cons i (ext-scale (aref values (+ (* g grp) i)) scale)))))))
+      ;; D -> per group, for the attention steps
+      (loop for (point values) in (take-virtual context (list l "D"))
+            do (dotimes (g nkv)
+                 (put-virtual context (list l g "D") (list point (subseq values (* g grp) (* (1+ g) grp))))))
+      ;; the gather of Requant8(o)
+      (destructuring-bind ((pa va)) (take-virtual context (list l "aselo"))
+        (gather-rowsum context "ao-g" tt pa kq
+                       (list (list (s+ p "o") (lambda () (rm-layout (getf w :o) cb)) (route-block context (s+ p "o"))))
+                       #'first nil (aref va 0) nil (s+ p "ro.jb") (lambda () (getf (getf w :ro) :jb)) cb))
+      ;; the O-projection product
+      (let ((cl (loop for (point values) in (take-virtual context (list l "acco"))
+                      collect (multiple-value-bind (po v) (combine-blocks context (subseq point 0 cb) values (nbits kd))
+                                (list po (nthcdr cb point) v)))))
+        (matmul context "oproj" (s+ p "qo") (lambda () (rm-layout (getf (getf w :ro) :q) cb)) kq (expt 2 tt)
+                (and (prover-p context) (layer-value layer "Wo")) kd cb cl
+                (lambda (point vals) (claim context (s+ p "Wo") point vals))))
+      (open-group context (s+ p "ao")))
+    state))
+
+(defun log2* (x) (1- (integer-length x)))
