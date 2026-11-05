@@ -906,7 +906,8 @@ llm.lisp as JSON.  The original Python code computed the same; TEST-FROZEN-CASES
     (export-llm-cases "ae877184d103fe2a5452288fe4e76236179eb960b78756e209546bbf6a0b86f7")
     (export-proto-cases "42336065bb45e4fa12f138c91bd4420f9dc48cd27c0f9cf99d415d9ad92f4dce")
     (export-table-cases "08854f911baa2c7006ff9a9d0372ce9ede9e0c50c2ed16fca5b4ad0776cdbd8c")
-    (export-step-mo-cases "00348957a008539af802f9075518564012739cdf1a4e5376ae4880a549cd6710"))
+    (export-step-mo-cases "00348957a008539af802f9075518564012739cdf1a4e5376ae4880a549cd6710")
+    (export-step-mlp-cases "f48dec4c0b3829d8d1d16a43ccccba42afd4d1ad91920fe7ee8ae6014061e338"))
   "The SHA-256 of each case file.  Before the Python code was removed, its verifiers checked these
 exact cases: the C++ vc_gkr_upper accepted the 8 GKR proofs and rejected 231 forgeries,
 zk/domain.py accepted the 16 domain proofs, zk/gpcs.py accepted the 3 commitment proofs and
@@ -915,7 +916,8 @@ rejected 287 forgeries, and zk/llm.py computed the same 18 layouts, 9 statements
 same values and rejected its 95 forgeries; Sable's logup.table_side, at 2^9 rows, replayed the
 table-side scenario with the same claims and chunk sums and rejected its 172 forgeries; Sable's
 Proto.step_mo replayed the tiny model's layer-0 MLP output step, left the same claims on 44 tensors,
-virtual claims and down-projection partials, and rejected all 1542 forgeries.  The files differ from those only in the proof magic
+virtual claims and down-projection partials, and rejected all 1542 forgeries; with the MLP slice
+after it (step_mlp), the same claims on 48 tensors and one-hot claims, all 2211 forgeries rejected.  The files differ from those only in the proof magic
 (EXACTPF1 for SABLEPF1).")
 
 (defun test-frozen-cases ()
@@ -1370,9 +1372,9 @@ model files and tokens.")
     (dotimes (i l) (setf h (exacta.model:layer-forward model (aref (exacta.model:model-layers model) i) h 2 256 tables)))
     (values (exacta.steps:layer-witness model l h shape tables) model shape)))
 
-(defun step-run (model shape l step group tensors &optional witness messages)
+(defun step-run (model shape l step groups tensors &optional witness messages)
   "One step of layer L in isolation (prover with WITNESS, or verifier of MESSAGES): the layout's
-groups declared without merge sets or segments, GROUP committed (from TENSORS), the step's lookups
+groups declared without merge sets or segments, GROUPS committed (TENSORS gives each group's), the step's lookups
 counted and assigned, Z and beta drawn, the layer's header, the step.  Returns what it left: every
 pending claim, the virtual claims and the step's state."
   (let* ((tr (if messages (make-transcript "step-test" 4 :messages messages) (make-transcript "step-test" 4)))
@@ -1381,7 +1383,8 @@ pending claim, the virtual claims and the step's state."
          (layout (exacta.llm:commitment-layout (exacta.model:model-cfg model) shape)))
     (loop for (name items pad) in (getf layout :raw-groups)
           do (exacta.proto:declare-group context name items :pad pad))
-    (exacta.proto:commit-group context group (and witness (funcall tensors witness)))
+    (dolist (group groups)
+      (exacta.proto:commit-group context group (and witness (funcall tensors witness group))))
     (let ((assignments
             (when witness
               (let ((chunks (exacta.tables:make-chunks)))
@@ -1426,16 +1429,14 @@ pending claim, the virtual claims and the step's state."
                                                       (loop for (b . v) in weights collect (format nil "[~D, ~A]" b (json-ext v)))
                                                       (json-ext value)))))))
 
-(defun export-step-mo-cases (path)
-  "Write step_mo of the tiny model's layer 0 (proof and everything it left), as JSON.  Sable's
-Proto.step_mo replayed exactly this; TEST-FROZEN-CASES pins it."
+(defun export-step-case (path step groups)
+  "Write STEP of the tiny model's layer 0 in isolation (its proof and everything it left), as JSON."
   (multiple-value-bind (w model shape) (step-witness "tiny" 0)
-    (let ((tensors (lambda (w) (list (cons "0.s2" (exacta.steps:rm-layout (getf w :s2) (exacta.llm:shape-cb shape)))
-                                     (cons "0.os2" (exacta.steps:rm-layout (getf w :os2) (exacta.llm:shape-cb shape)))))))
-      (multiple-value-bind (proved tr) (step-run model shape 0 #'exacta.steps:step-mo "0.mo" tensors w)
+    (let ((tensors (lambda (w group) (step-tensors w group shape))))
+      (multiple-value-bind (proved tr) (step-run model shape 0 step groups tensors w)
         (declare (ignore proved))
         (let* ((messages (transcript-messages tr))
-               (out (step-run model shape 0 #'exacta.steps:step-mo "0.mo" tensors nil messages))
+               (out (step-run model shape 0 step groups tensors nil messages))
                (state (getf out :state)))
           (with-open-file (s path :direction :output :if-exists :supersede)
             (format s "{\"proof\": \"~(~{~2,'0X~}~)\", \"layer\": 0,~%" (coerce (exacta.proofio:encode-proof messages) 'list))
@@ -1448,7 +1449,40 @@ Proto.step_mo replayed exactly this; TEST-FROZEN-CASES pins it."
             (format s "\"down\": [~{~A~^,~}],~%"
                     (loop for (po pm parts) in (exacta.steps::step-state-down-claims state)
                           collect (format nil "[~A, ~A, ~A]" (json-point po) (json-point pm) (json-vector parts))))
-            (format s "\"gather\": {~{~A~^,~}}}~%"
+            (format s "\"gather\": {~{~A~^,~}}"
                     (loop for (key point value) in (exacta.steps::step-state-gather state)
-                          collect (format nil "\"~A\": [~A, ~A]" key (json-point point) (json-ext value)))))))))
+                          collect (format nil "\"~A\": [~A, ~A]" key (json-point point) (json-ext value))))
+            (let ((oh (exacta.steps::step-state-oh-pending state)))
+              (when oh
+                (format s ",~%\"oh\": [~{~A~^,~}]"
+                        (loop for (jbn rho full) in oh
+                              collect (format nil "[\"~A\", ~A, ~A]" jbn (json-point rho) (json-vector full))))))
+            (format s "}~%"))))))
   path)
+
+(defun export-step-mo-cases (path)
+  "step_mo of the tiny model's layer 0.  Sable's Proto.step_mo replayed exactly this; TEST-FROZEN-CASES
+pins it."
+  (export-step-case path #'exacta.steps:step-mo '("0.mo")))
+
+(defun export-step-mlp-cases (path)
+  "step_mo, then the MLP slice, of the tiny model's layer 0.  Sable's Proto replayed exactly this;
+TEST-FROZEN-CASES pins it."
+  (export-step-case path #'step-mo-mlp '("0.mo" "0.mlp0")))
+
+(defun step-tensors (w group shape)
+  "The witness tensors of GROUP (Proto.tensors), for the groups the step tests commit."
+  (let ((cb (exacta.llm:shape-cb shape)))
+    (flet ((rm (m) (exacta.steps:rm-layout m cb)))
+      (cond ((string= group "0.mo") (list (cons "0.s2" (rm (getf w :s2))) (cons "0.os2" (rm (getf w :os2)))))
+            ((string= group "0.mlp0")
+             (let ((mlp (getf (getf w :forward) :mlp)))
+               (list (cons "0.m0.c" (rm (getf mlp :c))) (cons "0.m0.a" (rm (getf mlp :a)))
+                     (cons "0.m0.qu" (rm (getf (getf w :ru) :q))) (cons "0.m0.qm" (rm (getf (getf w :rm) :q))))))
+            (t (error "step-tensors: ~A" group))))))
+
+(defun step-mo-mlp (context model shape l state witness)
+  "step_mo, then every MLP slice (Proto.layer_steps' order)."
+  (exacta.steps:step-mo context model shape l state witness)
+  (dotimes (s (length (exacta.llm:mlp-slices shape)) state)
+    (exacta.steps:step-mlp context model shape l state witness s)))

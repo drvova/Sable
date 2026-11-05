@@ -18,7 +18,7 @@
            #:db #:make-db #:db-column #:db-zero #:db-lookup #:db-run
            #:route-block #:route-virtual #:route-public
            #:rq-rows #:ns-rows #:sr-rows #:cap-col #:combine-blocks
-           #:layer-parameters #:layer-head #:step-mo #:step-state))
+           #:layer-parameters #:layer-head #:step-mo #:step-mlp #:step-state #:matmul #:oh-check))
 
 (in-package #:exacta.steps)
 
@@ -286,8 +286,9 @@ alist DB-RUN substitutes."
 
 (defstruct step-state
   "What the steps pass on within a layer (Proto attributes): the down projection's per-slice
-claims and the gather targets."
-  down-claims gather)
+claims, the gather targets and their per-slice partial sums, and the one-hot claims waiting for
+their row check."
+  down-claims gather gather-parts oh-pending)
 
 (defun hexpr (s o)
   "The SatAdd output from the pre-saturation sum S and the flag O."
@@ -393,4 +394,290 @@ split into per-slice partial sums."
                                        (dotimes (tk (rows qm)) (setf af (ext+ af (ext-scale (aref et tk) (field (aref qm tk f))))))
                                        (setf acc (ext+ acc (ext* af wf)))))
                             acc))
+            'vector)))
+
+;;; ------------------------------------------------------------------ sub-protocols
+
+(defun check-eq (context label final a b)
+  "The verifier: every block's final of a shared eq(A, .) table equals eq(A, B)."
+  (unless (prover-p context)
+    (let ((e (reduce #'ext* (mapcar #'ext-eq1 a b) :initial-value (ext-one 4))))
+      (loop for v across final
+            unless (ext= v e) do (reject :sumcheck "~A: eq table final" label)))))
+
+(defun ext-eq1 (x y)
+  "eq(x, y) = x y + (1 - x)(1 - y)."
+  (ext+ (ext* x y) (ext* (ext- (ext-one 4) x) (ext- (ext-one 4) y))))
+
+(defun col-dot (a e kin mrows width)
+  "Per column x of A (rm layout: KIN blocks of MROWS rows of WIDTH): sum_m e[m] A[block][m][x]."
+  (let ((out (make-array (* kin width))))
+    (dotimes (blk kin out)
+      (dotimes (x width)
+        (let ((acc (make-ext 4)))
+          (dotimes (m mrows)
+            (let ((v (aref a (+ (* (+ (* blk mrows) m) width) x))))
+              (unless (zerop v) (setf acc (ext+ acc (ext-scale (aref e m) v))))))
+          (setf (aref out (+ (* blk width) x)) acc))))))
+
+(defun row-dot (w e nin nout)
+  "Per row r of the natural (NIN x NOUT) matrix W: sum_c e[c] W[r, c]."
+  (let ((out (make-array nin)))
+    (dotimes (r nin out)
+      (let ((acc (make-ext 4)))
+        (dotimes (c nout)
+          (let ((v (aref w r c))) (unless (zerop v) (setf acc (ext+ acc (ext-scale (aref e c) (field v)))))))
+        (setf (aref out r) acc)))))
+
+(defun matmul (context label a-name a-data kin mrows w-nat kout cb claims weight-claim &key (cbo cb))
+  "Claims (po pm value) on acc = A W, A row-major (MROWS x KIN 2^cb, A-DATA in rm layout) and W
+natural (KIN 2^cb x KOUT 2^cbo), reduced by one sumcheck over the inner index to claims on A's
+blocks and on W's blocks (tb, ob), in-block (o' low, t' high); WEIGHT-CLAIM receives those (point
+values) (llm.matmul)."
+  (when claims
+    (let* ((nin (* kin (expt 2 cb))) (nout (* kout (expt 2 cbo)))
+           (gam (context-challenge context (length claims)))
+           (claim (claim-sum context gam (mapcar #'third claims)))
+           (names (loop for i below (length claims)
+                        collect (list (intern (format nil "A~D" i) '#:exacta.steps) (intern (format nil "W~D" i) '#:exacta.steps)
+                                      (intern (format nil "G~D" i) '#:exacta.steps))))
+           (statement (piece `(+ ,@(loop for (an wn gn) in names collect `(* ,gn ,an ,wn)))))
+           (constants (loop for (nil nil gn) in names for g in gam collect (cons gn g)))
+           (tables (loop for (po pm) in claims for (an wn) in names
+                         append (if (prover-p context)
+                                    (list (list an :full 0 nil (col-dot (funcall a-data) (eq-table pm 4) kin mrows (expt 2 cb)))
+                                          (list wn :full 0 nil (row-dot w-nat (eq-table po 4) nin nout)))
+                                    (list (list an :full 0 nil nil) (list wn :full 0 nil nil))))))
+      (multiple-value-bind (rho finals) (run-sumcheck context label cb kin statement claim tables :constants constants)
+        ;; the weight claims are made after the loop: Sable puts them on a temporary tensor and moves
+        ;; them to the (packed) weight tensor, drawing its combination challenge, only then
+        (loop with weight-claims = '()
+              for (po pm) in claims
+              for i from 0
+              do (claim context a-name (append rho pm) (nth (* 2 i) finals))
+                 (let* ((po-low (subseq po 0 cbo))
+                        (vals (if (prover-p context)
+                                  (send-values context (weight-block-values w-nat po-low rho kin kout cb cbo))
+                                  (send-values context nil (list (* kin kout) 4))))
+                        (tau (nthcdr cbo po)))
+                   (unless (prover-p context)
+                     (dotimes (tb kin)
+                       (unless (ext= (block-combination context tau (subseq vals (* tb kout) (* (1+ tb) kout)))
+                                     (aref (nth (1+ (* 2 i)) finals) tb))
+                         (reject :matmul "matmul ~A: weight block values inconsistent" label))))
+                   (push (list (append po-low rho) vals) weight-claims))
+              finally (loop for (point vals) in (reverse weight-claims) do (funcall weight-claim point vals)))))))
+
+(defun weight-block-values (w po-low rho kin kout cb cbo)
+  "W's block (tb, ob) at (PO-LOW over o', RHO over t'), for every tb < KIN, ob < KOUT."
+  (let ((eo (eq-table po-low 4)) (et (eq-table rho 4))
+        (out (make-array (* kin kout))))
+    (dotimes (tb kin out)
+      (dotimes (ob kout)
+        (let ((acc (make-ext 4)))
+          (dotimes (tp (expt 2 cb))
+            (let ((row (make-ext 4)))
+              (dotimes (op (expt 2 cbo))
+                (let ((v (aref w (+ (* tb (expt 2 cb)) tp) (+ (* ob (expt 2 cbo)) op))))
+                  (unless (zerop v) (setf row (ext+ row (ext-scale (aref eo op) (field v)))))))
+              (setf acc (ext+ acc (ext* row (aref et tp))))))
+          (setf (aref out (+ (* tb kout) ob)) acc))))))
+
+(defun oh-check (context label jb-name cb nbk claims t* data-bits)
+  "Claims (point values) on OH(m, i) = eq(bits(j*_m), i) over a row-major (T x K 2^cb) domain,
+reduced to claims on the bit planes JB-NAME (llm.oh_check)."
+  (let ((taus (loop repeat (length claims) collect (context-challenge context nbk)))
+        (nb (+ cb nbk)))
+    (loop for (point values) in claims
+          for tau in taus
+          do (let* ((pj (subseq point 0 cb)) (pm (nthcdr cb point))
+                    (claim (block-combination context tau values))
+                    (xs (append pj tau))
+                    (bits (loop for i below nb collect (intern (format nil "B~D" i) '#:exacta.steps)))
+                    (cs (loop for i below nb
+                              collect (list (intern (format nil "X~DA" i) '#:exacta.steps) (intern (format nil "X~DB" i) '#:exacta.steps))))
+                    (statement `(* ,@(loop for b in bits for (ca cb*) in cs collect `(+ (* ,ca ,(piece b)) ,cb*))))
+                    (constants (loop for x in xs for (ca cb*) in cs
+                                     collect (cons ca (ext- (ext+ x x) (ext-one 4)))
+                                     collect (cons cb* (ext- (ext-one 4) x))))
+                    (tables (loop for b in bits for i from 0
+                                  collect (list b :full 0 nil (and (prover-p context) (row-field (nth i (funcall data-bits))))))))
+               (multiple-value-bind (rho finals)
+                   (run-sumcheck context (s+ label "-oh") t* 1 statement claim tables :eq pm :constants constants)
+                 (claim context jb-name rho (loop for f in finals for i from 0 collect (cons i (aref f 0)))))))))
+
+(defun jstar (bits)
+  "j* per row from its bit planes."
+  (let ((out (make-array (length (first bits)) :initial-element 0)))
+    (loop for plane in bits for i from 0
+          do (dotimes (m (length plane)) (incf (aref out m) (ash (aref plane m) i))))
+    out))
+
+(defun oh-slice (context state jb-name rho values b0 ks kf cb bits)
+  "One-hot claims on the slice's blocks: the prover sends OH on every block of the full row (KF
+blocks), the verifier checks the slice's against VALUES; the rest waits for the row check."
+  (let ((full (if (prover-p context)
+                  (let* ((j (jstar bits))
+                         (er (eq-table (nthcdr cb rho) 4)) (ec (eq-table (subseq rho 0 cb) 4))
+                         (acc (make-array kf :initial-element (make-ext 4))))
+                    (dotimes (m (length j))
+                      (let ((k (ash (aref j m) (- cb))))
+                        (setf (aref acc k) (ext+ (aref acc k) (ext* (aref er m) (aref ec (ldb (byte cb 0) (aref j m))))))))
+                    (send-values context acc))
+                  (send-values context nil (list kf 4)))))
+    (unless (prover-p context)
+      (dotimes (k ks)
+        (unless (ext= (aref full (+ b0 k)) (aref values k))
+          (reject :one-hot "one-hot slice values"))))
+    (setf (step-state-oh-pending state)
+          (append (step-state-oh-pending state) (list (list jb-name rho full))))))
+
+(defun slice-columns (m b0 b1 cb)
+  "Columns [b0 2^cb, b1 2^cb) of the matrix M."
+  (let ((out (make-matrix (rows m) (* (- b1 b0) (expt 2 cb)))))
+    (dotimes (i (rows m) out)
+      (dotimes (j (columns out)) (setf (aref out i j) (aref m i (+ j (* b0 (expt 2 cb)))))))))
+
+(defun slice-rows (m b0 b1 cb)
+  (let ((out (make-matrix (* (- b1 b0) (expt 2 cb)) (columns m))))
+    (dotimes (i (rows out) out)
+      (dotimes (j (columns m)) (setf (aref out i j) (aref m (+ i (* b0 (expt 2 cb))) j))))))
+
+(defun one-hot-table (j b0 ks tt cb)
+  "1 at each row's j* within the slice's blocks, in rm layout (Ks blocks of T x 2^cb)."
+  (let ((out (make-array (* ks tt (expt 2 cb)) :initial-element 0)))
+    (dotimes (m tt out)
+      (let ((blk (- (ash (aref j m) (- cb)) b0)))
+        (when (and (>= blk 0) (< blk ks))
+          (setf (aref out (+ (ash (+ (* blk tt) m) cb) (ldb (byte cb 0) (aref j m)))) 1))))))
+
+(defun step-mlp (context model shape l state witness s)
+  "MLP slice S (Proto.step_mlp): its domain (gate shift and SiLU, the up row's quantization, the
+product and its Requant), the minimality gather sumcheck, the one-hot slice claims, the down, gate
+and up products, and the opening of G_mlp<s>."
+  (let* ((cb (shape-cb shape)) (tt (shape-t* shape)) (kd (shape-kd shape)) (kf (shape-kf shape))
+         (layer (aref (model-layers model) l))
+         (p (format nil "~D." l)) (q (format nil "~D.m~D." l s))
+         (slices (mlp-slices shape))
+         (w witness) (mlp (getf (getf w :forward) :mlp)))
+    (destructuring-bind (b0 b1) (nth s slices)
+      (let* ((ks (- b1 b0))
+             (db (make-db context (s+ q "dom") (+ cb tt) :k ks))
+             (eg-minus (model-value model "eG"))
+             (kgc (map 'vector (lambda (e) (- eg-minus e)) (subseq (layer-value layer "eWg") (* b0 (expt 2 cb)) (* b1 (expt 2 cb))))))
+        (witness (every (lambda (k) (and (>= k 0) (< k 31))) kgc) "gate column shift outside [0, 31)")
+        (flet ((slice (m) (lambda () (rm-layout (slice-columns m b0 b1 cb) cb)))
+               (rowc (name data) (db-column db name data (route-block context name) :kind :row :c cb :shared t)))
+          (let* ((accg (db-column db "accg" (slice (getf mlp :accg)) (route-virtual context (list l s "accg"))))
+                 (accu (db-column db "accu" (slice (getf mlp :accu)) (route-virtual context (list l s "accu"))))
+                 (c (db-column db (s+ q "c") (slice (getf mlp :c)) (route-block context (s+ q "c"))))
+                 (a (db-column db (s+ q "a") (slice (getf mlp :a)) (route-block context (s+ q "a"))))
+                 (qu (db-column db (s+ q "qu") (slice (getf (getf w :ru) :q)) (route-block context (s+ q "qu"))))
+                 (qm (db-column db (s+ q "qm") (slice (getf (getf w :rm) :q)) (route-block context (s+ q "qm"))))
+                 (eg (rowc (s+ p "g.E") (lambda () (getf (getf w :eg) :e))))
+                 (peg (rowc (s+ p "g.pE") (lambda () (getf (getf w :eg) :pe))))
+                 (eu (rowc (s+ p "ru.e") (lambda () (getf (getf w :ru) :e))))
+                 (su (rowc (s+ p "ru.s") (lambda () (getf (getf w :ru) :s))))
+                 (em (rowc (s+ p "rm.e") (lambda () (getf (getf w :rm) :e))))
+                 (sm (rowc (s+ p "rm.s") (lambda () (getf (getf w :rm) :s))))
+                 (kg (db-column db "kgc" kgc (route-public context (lambda (pt) (column-mles kgc ks cb pt))) :kind :col :c cb))
+                 (pkv (map 'vector #'pow2* kgc))
+                 (pk (db-column db "pkg" pkv (route-public context (lambda (pt) (column-mles pkv ks cb pt))) :kind :col :c cb))
+                 (sg `(* ,pk ,peg)))
+            (db-lookup db `(+ ,kg ,eg) (list `(- (+ ,accg (* ,sg ,+inv2+)) (* ,sg ,c))))
+            (db-lookup db exacta.tables:+silu+ (list `(+ ,c ,(expt 2 14)) a))
+            (db-lookup db eu (list `(- (+ ,accu (* ,su ,+inv2+)) (* ,su ,qu))))
+            (db-lookup db exacta.tables:+star8+ (list `(+ ,qu 127)))
+            (db-lookup db `(+ ,em 1) (list `(+ (- (* 2 ,a ,qu) (* 2 ,sm ,qm)) ,sm)))
+            (let ((bd (cfg-down-b (model-cfg model))))
+              (if (= bd 127)
+                  (db-lookup db exacta.tables:+star8+ (list `(+ ,qm 127)))
+                  (let ((nb (1- (integer-length (1+ bd)))))
+                    (db-lookup db (1+ nb) (list `(+ ,qm ,bd)))
+                    (db-lookup db (1+ nb) (list `(- ,bd ,qm))))))
+            (db-run db)))
+        (when (active-p context)
+          (let* ((gather (step-state-gather state))
+                 (pu (second (assoc "aselu" gather :test #'string=)))
+                 (nsl (length slices)))
+            ;; the gathers' per-slice partial sums, once per layer
+            (when (= s 0)
+              (setf (step-state-gather-parts state)
+                    (loop for (key pt v) in gather
+                          collect (cons key
+                                        (let ((parts (if (prover-p context)
+                                                         (send-values context (gather-partials w key pt slices cb))
+                                                         (send-values context nil (list nsl 4)))))
+                                          (unless (prover-p context)
+                                            (unless (ext= v (reduce #'ext+ parts :initial-value (make-ext 4)))
+                                              (reject :gather "gather partial sums")))
+                                          parts)))))
+            (let* ((gam (context-challenge context))
+                   (parts (step-state-gather-parts state))
+                   (claim (if (prover-p context)
+                              (make-ext 4)
+                              (ext+ (aref (cdr (assoc "aselu" parts :test #'string=)) s)
+                                    (ext* gam (aref (cdr (assoc "aselm" parts :test #'string=)) s)))))
+                   (statement `(* ,(piece 't0) (+ ,(piece '(* t1 t3)) (* c0 ,(piece '(* t2 t4 t5))))))
+                   (prover (prover-p context))
+                   (tables (list (list 't0 :row cb t (and prover (eq-table pu 4)))
+                                 (list 't1 :full 0 nil (and prover (one-hot-table (jstar (getf (getf w :ru) :jb)) b0 ks (expt 2 tt) cb)))
+                                 (list 't2 :full 0 nil (and prover (one-hot-table (jstar (getf (getf w :rm) :jb)) b0 ks (expt 2 tt) cb)))
+                                 (list 't3 :full 0 nil (and prover (rm-layout (slice-columns (getf mlp :accu) b0 b1 cb) cb)))
+                                 (list 't4 :full 0 nil (and prover (rm-layout (slice-columns (getf mlp :a) b0 b1 cb) cb)))
+                                 (list 't5 :full 0 nil (and prover (rm-layout (slice-columns (getf (getf w :ru) :q) b0 b1 cb) cb))))))
+              (multiple-value-bind (rho finals)
+                  (run-sumcheck context "mlp-gather" (+ cb tt) ks statement claim tables :constants `((c0 . ,gam)))
+                (check-eq context "mlp-gather" (first finals) pu (nthcdr cb rho))
+                (put-virtual context (list l s "accu") (list rho (nth 3 finals)))
+                (claim context (s+ q "a") rho (nth 4 finals))
+                (claim context (s+ q "qu") rho (nth 5 finals))
+                (loop for (jbn idx key) in (list (list (s+ p "ru.jb") 1 :ru) (list (s+ p "rm.jb") 2 :rm))
+                      do (oh-slice context state jbn rho (nth idx finals) b0 ks kf cb (getf (getf w key) :jb)))))
+            ;; the down projection's partial over this slice
+            (let ((wd (and (prover-p context) (layer-value layer "Wd")))
+                  (wg (and (prover-p context) (layer-value layer "Wg")))
+                  (wu (and (prover-p context) (layer-value layer "Wu"))))
+              (matmul context "down" (s+ q "qm") (lambda () (rm-layout (slice-columns (getf (getf w :rm) :q) b0 b1 cb) cb))
+                      ks (expt 2 tt) (and wd (slice-rows wd b0 b1 cb)) kd cb
+                      (loop for (po pm parts) in (step-state-down-claims state) collect (list po pm (aref parts s)))
+                      (lambda (point vals)
+                        (claim context (s+ p "Wd") point
+                               (loop for v across vals for b from 0
+                                     collect (cons (+ (* (+ b0 (floor b kd)) kd) (mod b kd)) v)))))
+              ;; the gate and up products
+              (flet ((combined (key)
+                       (loop for (point values) in (take-virtual context (list l s key))
+                             collect (multiple-value-bind (po v) (combine-blocks context (subseq point 0 cb) values (nbits ks))
+                                       (list po (nthcdr cb point) v)))))
+                (let ((clg (combined "accg")) (clu (combined "accu")))
+                  (loop for (label wname wnat cl) in (list (list "gate" "Wg" wg clg) (list "up" "Wu" wu clu))
+                        do (let ((wname (s+ p wname)))
+                             (matmul context label (s+ p "qp2") (lambda () (rm-layout (getf (getf w :n2) :qp) cb))
+                                     kd (expt 2 tt) (and wnat (slice-columns wnat b0 b1 cb)) ks cb cl
+                                     (lambda (point vals)
+                                       (claim context wname point
+                                              (loop for v across vals for b from 0
+                                                    collect (cons (+ (* (floor b ks) kf) b0 (mod b ks)) v)))))))))))
+          (open-group context (format nil "~D.mlp~D" l s)))))
+    state))
+
+(defun column-mles (values ks cb point)
+  "Per block k < KS: the MLE of VALUES[k 2^cb ..] at POINT."
+  (coerce (loop for k below ks
+                collect (mle-eval (row-field (subseq values (* k (expt 2 cb)) (* (1+ k) (expt 2 cb)))) point 4))
+          'vector))
+
+(defun gather-partials (w key pt slices cb)
+  "Per slice: sum_m eq(PT, m) X[m, j*_m] [j*_m's block in the slice], X = accu (aselu) or m (aselm)."
+  (let* ((pack (getf w (if (string= key "aselu") :ru :rm)))
+         (j (jstar (getf pack :jb)))
+         (x (getf (getf (getf w :forward) :mlp) (if (string= key "aselu") :accu :m)))
+         (e (eq-table pt 4)))
+    (coerce (loop for (c0 c1) in slices
+                  collect (let ((acc (make-ext 4)))
+                            (dotimes (m (length j) acc)
+                              (let ((blk (ash (aref j m) (- cb))))
+                                (when (and (>= blk c0) (< blk c1))
+                                  (setf acc (ext+ acc (ext-scale (aref e m) (field (aref x m (aref j m)))))))))))
             'vector)))

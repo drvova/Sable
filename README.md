@@ -49,7 +49,7 @@ that way without Python:
 | The lookup table: its 2^26 rows, the model's value tables, multiplicities, the LogUp table side; public MLEs | done (stage 8b) | `zk/tables.py` and `zk/model.py`: every column and value table equal; `logup.table_side`: one scenario, 172 forgeries |
 | Commitments and GKR at the table's size (2^26 rows) | not yet (stage 8b2) | |
 | F_O: the model file, every gadget, the forward pass (dense layers, QK-norm) | done (stage 8c) | `zk/model.py`: all 54 intermediate values of two tiny models' passes equal |
-| Per-layer steps of the model's proof | in progress (stage 8d): the MLP output step | `Proto.step_mo` on the tiny model's layer 0: same claims on 44 tensors, all 1542 forgeries rejected |
+| Per-layer steps of the model's proof | in progress (stage 8d): the MLP output and the MLP slices | `Proto.step_mo` and `step_mlp` on the tiny model's layer 0: same claims on 48 tensors, all 2211 forgeries rejected |
 | MoE layers; quantizing a BF16 checkpoint into F_O | not yet | |
 | Prover for whole models | not yet | |
 
@@ -205,7 +205,7 @@ The second column names the Sable code that each file reimplements.
 | `tables.lisp` | `zk/tables.py`, `zk/logup.py`, the table functions of `zk/model.py` | the global lookup table: tags, layout and rows, the model's value tables (`exp-values`, `silu-values`, `samp-values`, `router-values`, `rope-tables`), `build-table`; chunks and `count-lookups`; `table-side`, the table's half of LogUp |
 | `public.lisp` | `zk/mlepub.py` | closed-form MLEs of public vectors: `iota`, `le-low-high`, `lt-const`, `eq-const`, `vocab-indicator` |
 | `model.lisp` | `zk/model.py` | F_O: the model file (`read-model`), the gadgets with their witness values (`requant8`, `normscale`, `shiftq8s`, `qkv-out`, `rope8`, `gshiftround`, `satadd`, `norm-den`, `mulround`, `norm-div`, …), `attention-rows`, `mlp-out`, `layer-forward`, `final-logits`, `forward` |
-| `steps.lisp` | the steps of `zk/llm.py`'s `Proto`, `LayerWit` | the per-layer steps: the layer witness (`layer-witness`, `rq-pack`, `ns-pack`, `sr-pack`, `rm-layout`), the domain builder (`make-db`, `db-column`, `db-zero`, `db-lookup`, `db-run`) with its routes, the per-row gadgets (`rq-rows`, `ns-rows`, `sr-rows`, `cap-col`), `layer-head`, `step-mo` |
+| `steps.lisp` | the steps of `zk/llm.py`'s `Proto`, `LayerWit` | the per-layer steps: the layer witness (`layer-witness`, `rq-pack`, `ns-pack`, `sr-pack`, `rm-layout`), the domain builder (`make-db`, `db-column`, `db-zero`, `db-lookup`, `db-run`) with its routes, the per-row gadgets (`rq-rows`, `ns-rows`, `sr-rows`, `cap-col`), `layer-head`, `step-mo`, `step-mlp`, with `matmul` and `oh-check` |
 | `llm.lisp` | the outer layer of `zk/llm.py`, `zk/proto.py` | the transformer protocol's public side: `make-cfg`, `make-shape`, `column-block-bits`, the commitment layout (`commitment-layout`: groups, packing, merge sets, segments, weight groups; `declare-units`), the policy and its encoding, `check-statement`, `statement`, `sampling-seed`, `weights-digest` (C_W) |
 | `toplevel.lisp` | | the executable: evaluates forms in `exacta-user`; `(help)` |
 
